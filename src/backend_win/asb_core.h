@@ -200,6 +200,10 @@ ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
 
+/* Message for a network-mode change (NULL when allowed). Refused while shared
+   folders exist and the new mode is not NAT. */
+ASB_API const wchar_t *asb_vm_validate_network(AsbVm vm, int mode);
+
 /* ---- Shared host folders (Windows guests on NAT networking) ---- */
 
 /* Replace the VM's shared-folder list. Fills in missing share names, validates

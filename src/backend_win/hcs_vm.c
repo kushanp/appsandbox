@@ -1464,8 +1464,9 @@ HRESULT hcs_start_vm(VmInstance *instance)
         return E_NOT_VALID_STATE;
 
     /* Publish shared host folders before the guest can ask for them; the guest
-       agent maps the drive letters as soon as it connects. */
-    if (instance->host_shares.count > 0)
+       agent maps the drive letters as soon as it connects. Shares only make
+       sense on NAT: that is the only mode where the guest can reach the host. */
+    if (instance->host_shares.count > 0 && instance->network_mode == NET_NAT)
         asb_shares_publish(instance->name, &instance->host_shares);
 
     op = pfnCreateOp(NULL, NULL);

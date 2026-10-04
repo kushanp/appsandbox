@@ -616,7 +616,11 @@ function onSharedFolderBrowseResult(msg) {
 function sharedFoldersBadge(vm) {
     var folders = vm.sharedFolders || [];
     if (!folders.length) return '';
-    var letters = folders.map(function(f) { return f.driveLetter ? f.driveLetter + ':' : 'free'; });
+    var letters = folders.map(function(f) {
+        var letter = f.letter || f.driveLetter;
+        var shown = letter ? letter + ':' : 'free';
+        return f.status === 'failed' ? shown + ' \u26A0' : shown;
+    });
     return ' \u00B7 ' + letters.join(', ');
 }
 
@@ -624,7 +628,11 @@ function sharedFoldersTooltip(vm) {
     var folders = vm.sharedFolders || [];
     if (!folders.length) return '';
     return '\nShared with the host: ' + folders.map(function(f) {
-        return f.path + ' as ' + (f.driveLetter ? f.driveLetter + ':' : 'a free letter');
+        var letter = f.letter || f.driveLetter;
+        var line = f.path + ' as ' + (letter ? letter + ':' : 'a free letter');
+        if (f.status === 'failed') line += ' - mapping failed: ' + (f.detail || 'no reason reported');
+        else if (f.status === 'pending') line += ' - not mapped yet';
+        return line;
     }).join('; ');
 }
 

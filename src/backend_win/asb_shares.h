@@ -32,6 +32,10 @@ typedef struct {
     wchar_t user[128];                    /* host account the guest authenticates as (may be empty) */
     wchar_t pass_enc[4096];               /* DPAPI blob of the password, hex-encoded (empty = none) */
     BOOL    read_only;                    /* reserved: shares are currently read-write */
+    /* Runtime only (never written to the config): the password was inherited
+       from the stored list, so it has already been checked against the account
+       and must not spend another sign-in attempt. */
+    BOOL    skip_account_check;
 } AsbHostShare;
 
 typedef struct {
@@ -57,6 +61,12 @@ HRESULT asb_shares_publish(const wchar_t *vm_name, const AsbHostShareList *list)
 /* Withdraw every share in the list: delete the SMB shares and their firewall
    rules. Idempotent; safe to call for a list whose shares were never created. */
 void asb_shares_withdraw(const AsbHostShareList *list);
+
+/* Cleanup after an unclean exit: list the host's published AppSandbox shares so
+   the caller can drop the ones no running VM uses, and remove one by name
+   (share plus firewall rule). Names are copied into names[][], up to max. */
+int  asb_shares_enum_published(wchar_t (*names)[ASB_SHARE_NAME_MAX], int max);
+void asb_shares_remove_by_name(const wchar_t *share_name);
 
 /* Encrypt/decrypt a share password with DPAPI, hex-encoded for the config
    file. Both return FALSE on failure (out is then empty). */

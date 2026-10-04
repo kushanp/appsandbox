@@ -2845,6 +2845,39 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
 
 /* ---- Init / Cleanup ---- */
 
+/* ---- Shared host folders: startup cleanup ---- */
+
+/* An unclean exit (crash, or a killed process) leaves the SMB share and its
+   firewall rule published. Drop those that no *running* VM still uses, so a
+   stale share can never outlive the VM it belonged to. */
+static void sweep_orphan_shares(void)
+{
+    wchar_t (*names)[ASB_SHARE_NAME_MAX];
+    int count, i, v, s;
+    size_t cap = (size_t)ASB_MAX_HOST_SHARES * ASB_MAX_VMS;
+
+    if (ASB_MAX_HOST_SHARES <= 0) return;
+    names = (wchar_t (*)[ASB_SHARE_NAME_MAX])HeapAlloc(GetProcessHeap(), 0,
+                                                       sizeof(wchar_t) * ASB_SHARE_NAME_MAX * cap);
+    if (!names) return;
+
+    count = asb_shares_enum_published(names, (int)cap);
+    for (i = 0; i < count; i++) {
+        BOOL keep = FALSE;
+        for (v = 0; v < g_vm_count && !keep; v++) {
+            if (g_vms[v].is_template) continue;
+            for (s = 0; s < g_vms[v].host_shares.count; s++) {
+                if (_wcsicmp(g_vms[v].host_shares.items[s].share_name, names[i]) != 0) continue;
+                if (hcs_is_running_by_enum(g_vms[v].name)) keep = TRUE;
+                break;
+            }
+        }
+        if (!keep) asb_shares_remove_by_name(names[i]);
+    }
+
+    HeapFree(GetProcessHeap(), 0, names);
+}
+
 ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
@@ -2878,6 +2911,7 @@ ASB_API HRESULT asb_init(void)
 
     load_vm_list();
     scan_templates();
+    sweep_orphan_shares();
 
     if (g_vm_count > 0) asb_log(L"Loaded %d VM(s) from config.", g_vm_count);
     if (g_template_count > 0) asb_log(L"Found %d template(s).", g_template_count);
@@ -4185,10 +4219,26 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running) return E_ACCESSDENIED;
     if (mode < 0 || mode > 3) return E_INVALIDARG;
+    /* Shared folders are reached through the NAT gateway; keep the two in step
+       rather than publishing a share the guest cannot reach. */
+    if (mode != ASB_NET_NAT && g_vms[idx].host_shares.count > 0) return E_INVALIDARG;
     g_vms[idx].network_mode = mode;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
+}
+
+/* Message for a network-mode change the caller is about to attempt (NULL when
+   it is fine). Paired with the check inside asb_vm_set_network so the UI and
+   the headless API can explain the refusal. */
+ASB_API const wchar_t *asb_vm_validate_network(AsbVm vm, int mode)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return L"Unknown VM.";
+    if (mode < 0 || mode > 3) return L"Network mode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal).";
+    if (mode != ASB_NET_NAT && g_vms[idx].host_shares.count > 0)
+        return L"Shared folders need NAT networking. Remove them before changing the network mode.";
+    return NULL;
 }
 
 /* ---- Shared host folders ---- */
@@ -4199,6 +4249,7 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
    directly; it mutates *list. Returns NULL when the list is usable. */
 ASB_API const wchar_t *asb_vm_validate_shares(AsbVm vm, AsbHostShareList *list)
 {
+    static wchar_t account_msg[512];
     int idx = vm_index_of(vm);
     int i, j;
 
@@ -4211,10 +4262,22 @@ ASB_API const wchar_t *asb_vm_validate_shares(AsbVm vm, AsbHostShareList *list)
         for (j = 0; j < g_vms[idx].host_shares.count; j++) {
             const AsbHostShare *old = &g_vms[idx].host_shares.items[j];
             if (_wcsicmp(old->host_path, s->host_path) != 0) continue;
+
+            /* Same folder, different account: the stored password belongs to the
+               other account, so say so instead of failing inside the guest. */
+            if (s->user[0] && old->user[0] && _wcsicmp(old->user, s->user) != 0) {
+                swprintf_s(account_msg, ARRAYSIZE(account_msg),
+                    L"%s is already shared as \"%s\". Enter that account's password, "
+                    L"or remove the folder and add it again for \"%s\".",
+                    s->host_path, old->user, s->user);
+                return account_msg;
+            }
+
             if (!old->pass_enc[0]) break;
             wcsncpy_s(s->pass_enc, ARRAYSIZE(s->pass_enc), old->pass_enc, _TRUNCATE);
             if (!s->user[0])
                 wcsncpy_s(s->user, ARRAYSIZE(s->user), old->user, _TRUNCATE);
+            s->skip_account_check = TRUE;   /* stored secret, already checked once */
             break;
         }
     }

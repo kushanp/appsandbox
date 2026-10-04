@@ -359,11 +359,25 @@ Requirements and behavior:
 
 - The VM must use **NAT networking** (`networkMode: 1`): the guest reaches the
   host at its NAT gateway. Creating or editing with `sharedFolders` and any
-  other mode is rejected with `400`.
+  other mode is rejected with `400`, and `networkMode` cannot be changed away
+  from NAT while shares exist.
+- The named account is checked when the list is saved: it must exist, match the
+  password, and be able to read **and write** the folder, or the request comes
+  back `400` with the reason. That check spends one sign-in attempt against the
+  account's lockout policy, so a wrong password can lock the account (the guest
+  would spend the same attempts on its next boot). An entry sent **without** a
+  password reuses the stored one and is not re-checked.
 - The host share and its firewall rule (inbound TCP 445 from the VM subnet
-  only) exist **while the VM runs** and are removed when it stops.
-- The account you name must be able to read and write the folder (its NTFS
-  permissions apply), and the daemon must run elevated to publish the share.
+  only) exist **while the VM runs** and are removed when it stops. Shares left
+  behind by an unclean exit are removed at the next daemon start unless a
+  running VM still uses them.
+- The account's NTFS permissions decide what the guest can do with the folder.
+- `status()` reports what happened per share in `sharedFolders[]`: `letter` is
+  the drive letter the guest actually mapped, `status` is `pending`, `ok` or
+  `failed`, and `detail` carries the guest's own reason (for example
+  `error:2:System error 86 ... The specified network password is not correct.`).
+  A share the guest could not map is re-sent up to 12 times, 20 s apart, so
+  fixing the account and waiting is usually enough to bring the drive up.
 - Removing an entry (or passing `sharedFolders: []`) deletes the share and, in
   the guest, the drive mapping on the next boot.
 

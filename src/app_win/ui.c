@@ -329,7 +329,11 @@ static void build_vm_json(JsonBuilder *jb, int i)
             } else {
                 jb_string(jb, L"driveLetter", L"");
             }
+            jb_string(jb, L"letter", v->share_letter[s]);   /* what the guest mapped */
             jb_string(jb, L"user", sh->user);
+            jb_string(jb, L"status", v->share_state[s] == 1 ? L"ok" :
+                                     v->share_state[s] == 2 ? L"failed" : L"pending");
+            jb_string(jb, L"detail", v->share_detail[s]);
             jb_bool(jb, L"readOnly", sh->read_only);
             jb_object_end(jb);
         }
@@ -1259,7 +1263,11 @@ static void on_webview2_message(const wchar_t *json)
                         error = asb_validate_gpu_selection(mode, gpu_id);
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
-                else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"networkMode") == 0) {
+                    int mode = _wtoi(value);
+                    error = asb_vm_validate_network(vm, mode);
+                    if (!error) hr = asb_vm_set_network(vm, mode);
+                }
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }

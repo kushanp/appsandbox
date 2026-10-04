@@ -279,8 +279,15 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
                              s->drive_letter);
         else
             pos += sprintf_s(out + pos, cap - pos, ",\"driveLetter\":\"\"");
+        /* letter = what the guest actually mapped, "" until it reports. */
+        pos += sprintf_s(out + pos, cap - pos, ",\"letter\":");
+        pos = append_wstr(out, cap, pos, v->share_letter[i]);
         pos += sprintf_s(out + pos, cap - pos, ",\"user\":");
         pos = append_wstr(out, cap, pos, s->user);
+        pos += sprintf_s(out + pos, cap - pos, ",\"status\":\"%s\",\"detail\":",
+                         v->share_state[i] == 1 ? "ok" :
+                         v->share_state[i] == 2 ? "failed" : "pending");
+        pos = append_wstr(out, cap, pos, v->share_detail[i]);
         pos += sprintf_s(out + pos, cap - pos, ",\"readOnly\":%s}",
                          s->read_only ? "true" : "false");
     }
@@ -883,7 +890,15 @@ static int handle_request(PHTTP_REQUEST req)
                     }
                 }
                 if (json_get_int(body, L"networkMode", &iv)) {
+                    const wchar_t *nerr;
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
+                    nerr = asb_vm_validate_network(vm, iv);
+                    if (nerr) {
+                        char message[512] = {0};
+                        WideCharToMultiByte(CP_UTF8, 0, nerr, -1, message, sizeof(message), NULL, NULL);
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                        return 0;
+                    }
                     hr = asb_vm_set_network(vm, iv);
                 }
                 if (json_has_key(body, L"sharedFolders")) {

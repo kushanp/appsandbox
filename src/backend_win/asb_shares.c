@@ -13,6 +13,7 @@
 
 #include <windows.h>
 #include <wincrypt.h>
+#include <lm.h>
 #include <stdio.h>
 #include <wchar.h>
 #include <ctype.h>
@@ -22,34 +23,75 @@
 #include "ui.h"
 
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "netapi32.lib")
 
 /* ---- Small helpers ---- */
 
-/* Run a command line hidden and wait for it. Returns the exit code, or -1 if
-   the process could not be started. */
-static int run_hidden(const wchar_t *cmdline)
+/* Run a command line hidden and wait for it. stdout/stderr are captured into
+   out (newlines collapsed to spaces) so a failure carries its reason - "System
+   error 5 has occurred. Access is denied." instead of a bare exit code.
+   Returns the exit code, or -1 if the process could not be started. */
+static int run_hidden(const wchar_t *cmdline, char *out, size_t out_chars)
 {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sec;
+    HANDLE rd = NULL, wr = NULL;
     wchar_t *mut;
     DWORD code = 0;
     size_t len = wcslen(cmdline) + 1;
+
+    if (out && out_chars) out[0] = '\0';
 
     mut = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, len * sizeof(wchar_t));
     if (!mut) return -1;
     wcscpy_s(mut, len, cmdline);
 
+    if (out && out_chars) {
+        sec.nLength = sizeof(sec);
+        sec.bInheritHandle = TRUE;
+        sec.lpSecurityDescriptor = NULL;
+        if (CreatePipe(&rd, &wr, &sec, 0))
+            SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        else
+            rd = wr = NULL;
+    }
+
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
+    if (wr) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+        si.hStdInput = NULL;
+    }
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessW(NULL, mut, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+    if (!CreateProcessW(NULL, mut, NULL, NULL, wr ? TRUE : FALSE, CREATE_NO_WINDOW,
                         NULL, NULL, &si, &pi)) {
+        if (wr) CloseHandle(wr);
+        if (rd) CloseHandle(rd);
         HeapFree(GetProcessHeap(), 0, mut);
         return -1;
     }
+    if (wr) CloseHandle(wr);          /* our copy; the child holds the other end */
+
+    if (rd) {
+        DWORD got = 0, total = 0;
+        while (total + 1 < (DWORD)out_chars &&
+               ReadFile(rd, out + total, (DWORD)(out_chars - 1 - total), &got, NULL) && got > 0)
+            total += got;
+        out[total] = '\0';
+        CloseHandle(rd);
+        {
+            char *c;
+            for (c = out; *c; c++)
+                if (*c == '\r' || *c == '\n' || *c == '\t') *c = ' ';
+        }
+    }
+
     WaitForSingleObject(pi.hProcess, 30000);
     if (!GetExitCodeProcess(pi.hProcess, &code)) code = (DWORD)-1;
     CloseHandle(pi.hThread);
@@ -174,6 +216,7 @@ BOOL asb_share_unprotect_password(const wchar_t *enc, wchar_t *out, size_t out_c
     DATA_BLOB in, plain;
     BYTE blob[1024];
     DWORD blob_len = 0;
+    int n;
 
     if (out_chars == 0) return FALSE;
     out[0] = L'\0';
@@ -189,12 +232,15 @@ BOOL asb_share_unprotect_password(const wchar_t *enc, wchar_t *out, size_t out_c
                             CRYPTPROTECT_UI_FORBIDDEN, &plain))
         return FALSE;
 
-    MultiByteToWideChar(CP_UTF8, 0, (const char *)plain.pbData, (int)plain.cbData,
-                        out, (int)out_chars);
-    out[out_chars - 1] = L'\0';
+    /* The protected bytes carry no terminator, and MultiByteToWideChar only
+       writes one for a -1 length: terminate the string ourselves, or the
+       password runs on into whatever follows in the buffer. */
+    n = MultiByteToWideChar(CP_UTF8, 0, (const char *)plain.pbData, (int)plain.cbData,
+                            out, (int)out_chars - 1);
+    if (n > 0) out[n] = L'\0';
     LocalFree(plain.pbData);
     SecureZeroMemory(blob, sizeof(blob));
-    return TRUE;
+    return n > 0;
 }
 
 /* ---- Naming ---- */
@@ -223,6 +269,108 @@ void asb_shares_name_for_vm(AsbHostShareList *list, const wchar_t *vm_name)
 }
 
 /* ---- Validation ---- */
+
+/* Prove the share's account exists, the stored password is its password, and the
+   account can actually open the folder. Catching this here reports the problem
+   in the UI instead of as a failed drive mapping inside the guest later.
+   Returns NULL when the share is usable, otherwise a message. */
+static const wchar_t *check_share_account(const AsbHostShare *s)
+{
+    static wchar_t msg[512];
+    wchar_t pass[256], account[192], domain[128], name[160], *slash;
+    HANDLE token = NULL, dir = NULL;
+    DWORD err;
+
+    /* An inherited password was checked when it was stored; re-checking it on
+       every save would burn sign-in attempts against the account's lockout
+       policy without telling us anything new. Runtime status covers the case
+       where the account's password changed behind our back. */
+    if (s->skip_account_check) return NULL;
+
+    if (!asb_share_unprotect_password(s->pass_enc, pass, ARRAYSIZE(pass)))
+        return L"The stored password for this shared folder could not be read; enter it again.";
+
+    /* An explicit domain ("MACHINE\user" or ".\user") is used as given; a bare
+       name is a local account on this host. */
+    wcscpy_s(account, ARRAYSIZE(account), s->user);
+    slash = wcschr(account, L'\\');
+    if (slash) {
+        *slash = L'\0';
+        wcscpy_s(domain, ARRAYSIZE(domain), account);
+        wcscpy_s(name, ARRAYSIZE(name), slash + 1);
+    } else {
+        domain[0] = L'\0';
+        wcscpy_s(name, ARRAYSIZE(name), account);
+    }
+
+    if (!LogonUserW(name, domain[0] ? domain : L".", pass, LOGON32_LOGON_NETWORK,
+                    LOGON32_PROVIDER_DEFAULT, &token)) {
+        err = GetLastError();
+        SecureZeroMemory(pass, sizeof(pass));
+        switch (err) {
+        case ERROR_LOGON_FAILURE:            /* 1326 */
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The host account or password for \"%s\" is incorrect.", s->user);
+            break;
+        case ERROR_ACCOUNT_DISABLED:
+            swprintf_s(msg, ARRAYSIZE(msg), L"The host account \"%s\" is disabled.", s->user);
+            break;
+        case ERROR_ACCOUNT_RESTRICTION:      /* 1327 - often a blank password */
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The host account \"%s\" cannot sign in with this password (Windows policy).",
+                s->user);
+            break;
+        case ERROR_ACCOUNT_LOCKED_OUT:       /* 1909 */
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The host account \"%s\" is locked out after failed sign-in attempts. "
+                L"Unlock it, or wait for the lockout window to pass, then try again.", s->user);
+            break;
+        case ERROR_PASSWORD_EXPIRED:         /* 1330 */
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The password for the host account \"%s\" has expired.", s->user);
+            break;
+        case ERROR_PASSWORD_MUST_CHANGE:     /* 1907 */
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The host account \"%s\" must change its password before it can sign in.", s->user);
+            break;
+        case ERROR_ACCOUNT_EXPIRED:
+            swprintf_s(msg, ARRAYSIZE(msg), L"The host account \"%s\" has expired.", s->user);
+            break;
+        default:
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The host account \"%s\" could not be used (error %lu).", s->user, err);
+            break;
+        }
+        return msg;
+    }
+    SecureZeroMemory(pass, sizeof(pass));
+
+    /* NTFS rights decide what the guest can do, so ask the account directly. */
+    if (!ImpersonateLoggedOnUser(token)) {
+        err = GetLastError();
+        CloseHandle(token);
+        swprintf_s(msg, ARRAYSIZE(msg),
+            L"Could not check what \"%s\" can do in %s (error %lu).", s->user, s->host_path, err);
+        return msg;
+    }
+
+    dir = CreateFileW(s->host_path, FILE_LIST_DIRECTORY | FILE_ADD_FILE,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (dir == INVALID_HANDLE_VALUE) {
+        err = GetLastError();
+        RevertToSelf();
+        CloseHandle(token);
+        swprintf_s(msg, ARRAYSIZE(msg),
+            L"The host account \"%s\" cannot read and write %s (error %lu). "
+            L"Grant it access to that folder.", s->user, s->host_path, err);
+        return msg;
+    }
+    CloseHandle(dir);
+    RevertToSelf();
+    CloseHandle(token);
+    return NULL;
+}
 
 const wchar_t *asb_shares_validate(const AsbHostShareList *list, int network_mode)
 {
@@ -266,6 +414,13 @@ const wchar_t *asb_shares_validate(const AsbHostShareList *list, int network_mod
                 towupper(p->drive_letter) == towupper(s->drive_letter))
                 return L"Two shared folders claim the same drive letter.";
         }
+
+        /* Last, because it talks to the account database: the account must
+           exist, match the stored password, and be able to open the folder. */
+        {
+            const wchar_t *account_error = check_share_account(s);
+            if (account_error) return account_error;
+        }
     }
     return NULL;
 }
@@ -285,12 +440,13 @@ static void firewall_delete(const wchar_t *share_name)
     rule_name_for(share_name, rule, ARRAYSIZE(rule));
     swprintf_s(cmd, ARRAYSIZE(cmd),
         L"netsh.exe advfirewall firewall delete rule name=\"%s\"", rule);
-    (void)run_hidden(cmd);
+    (void)run_hidden(cmd, NULL, 0);
 }
 
 static BOOL firewall_allow_share(const wchar_t *share_name)
 {
     wchar_t rule[256], cmd[800];
+    char why[512];
     const char *base = hcn_nat_subnet_base();
 
     rule_name_for(share_name, rule, ARRAYSIZE(rule));
@@ -300,13 +456,19 @@ static BOOL firewall_allow_share(const wchar_t *share_name)
         L"netsh.exe advfirewall firewall add rule name=\"%s\" dir=in action=allow "
         L"protocol=TCP localport=445 remoteip=%S.0/24 profile=any",
         rule, base);
-    return run_hidden(cmd) == 0;
+    if (run_hidden(cmd, why, sizeof(why)) != 0) {
+        ui_log(L"Firewall rule for share %s failed: %S", share_name, why);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 HRESULT asb_shares_publish(const wchar_t *vm_name, const AsbHostShareList *list)
 {
     int i, published = 0, failed = 0;
     wchar_t cmd[1600];
+    char why[512];
+    int rc;
 
     (void)vm_name;
     if (!list || list->count == 0) return S_OK;
@@ -324,21 +486,27 @@ HRESULT asb_shares_publish(const wchar_t *vm_name, const AsbHostShareList *list)
         /* Share names are namespaced ("AppSandbox.<vm>.<n>"), so replacing an
            entry of ours is safe; delete first so a stale grant cannot linger. */
         swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe share \"%s\" /delete /y", s->share_name);
-        (void)run_hidden(cmd);
+        (void)run_hidden(cmd, NULL, 0);
 
         if (swprintf_s(cmd, ARRAYSIZE(cmd),
                 L"net.exe share \"%s\"=\"%s\" /grant:\"%s\",FULL /cache:none "
                 L"/remark:\"AppSandbox shared folder\"",
-                s->share_name, s->host_path, s->user) < 0 ||
-            run_hidden(cmd) != 0) {
-            ui_log(L"Failed to publish share %s for %s (run as administrator?)",
-                   s->share_name, s->host_path);
+                s->share_name, s->host_path, s->user) < 0) {
+            ui_log(L"Failed to publish share %s: the command line does not fit.", s->share_name);
+            failed++;
+            continue;
+        }
+        rc = run_hidden(cmd, why, sizeof(why));
+        if (rc != 0) {
+            ui_log(L"Failed to publish share %s for %s: %S", s->share_name, s->host_path, why);
             failed++;
             continue;
         }
 
         if (!firewall_allow_share(s->share_name)) {
-            ui_log(L"Failed to open inbound SMB for share %s (firewall)", s->share_name);
+            /* Leave nothing half-done: the guest could not reach it anyway. */
+            swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe share \"%s\" /delete /y", s->share_name);
+            (void)run_hidden(cmd, NULL, 0);
             failed++;
             continue;
         }
@@ -364,10 +532,51 @@ void asb_shares_withdraw(const AsbHostShareList *list)
         if (!s->share_name[0]) continue;
 
         swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe share \"%s\" /delete /y", s->share_name);
-        (void)run_hidden(cmd);
+        (void)run_hidden(cmd, NULL, 0);
         firewall_delete(s->share_name);
         ui_log(L"Shared folder withdrawn: %s", s->share_name);
     }
+}
+
+/* ---- Orphan cleanup (unclean exit) ---- */
+
+int asb_shares_enum_published(wchar_t (*names)[ASB_SHARE_NAME_MAX], int max)
+{
+    PSHARE_INFO_2 info = NULL;
+    DWORD read = 0, total = 0, resume = 0;
+    NET_API_STATUS status;
+    int found = 0, i;
+
+    if (!names || max <= 0) return 0;
+
+    status = NetShareEnum(NULL, 2, (LPBYTE *)&info, MAX_PREFERRED_LENGTH,
+                          &read, &total, &resume);
+    if (status != NERR_Success && status != ERROR_MORE_DATA) {
+        ui_log(L"Could not list host shares (error %lu); leftover shares are not cleaned up.",
+               (unsigned long)status);
+        return 0;
+    }
+
+    for (i = 0; i < (int)read && found < max; i++) {
+        if (_wcsnicmp(info[i].shi2_netname, L"AppSandbox.", 11) != 0) continue;
+        wcsncpy_s(names[found], ASB_SHARE_NAME_MAX, info[i].shi2_netname, _TRUNCATE);
+        found++;
+    }
+
+    if (info) NetApiBufferFree(info);
+    return found;
+}
+
+void asb_shares_remove_by_name(const wchar_t *share_name)
+{
+    wchar_t cmd[600];
+
+    if (!share_name || !share_name[0]) return;
+
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe share \"%s\" /delete /y", share_name);
+    (void)run_hidden(cmd, NULL, 0);
+    firewall_delete(share_name);
+    ui_log(L"Removed leftover share %s (no running VM uses it).", share_name);
 }
 
 /* ---- Guest-side mapping line ---- */
