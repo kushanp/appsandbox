@@ -364,10 +364,30 @@ static void send_response(HTTP_REQUEST_ID reqId, USHORT status, const char *reas
 static void send_json(HTTP_REQUEST_ID id, USHORT status, const char *reason, const char *body)
 { send_response(id, status, reason, "application/json", body); }
 
+/* Copy src into dst as the body of a JSON string: quotes and backslashes are
+   escaped, control characters become spaces. Windows paths in an error message
+   used to break the response body, which is invalid JSON for every client. */
+static void json_escape(const char *src, char *dst, size_t dst_chars)
+{
+    size_t o = 0;
+
+    for (; src && *src && o + 7 < dst_chars; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"') { dst[o++] = '\\'; dst[o++] = '"'; }
+        else if (c == '\\') { dst[o++] = '\\'; dst[o++] = '\\'; }
+        else if (c == '\n' || c == '\r' || c == '\t') dst[o++] = ' ';
+        else if (c < 0x20) dst[o++] = ' ';
+        else dst[o++] = (char)c;
+    }
+    dst[o] = '\0';
+}
+
 static void send_err(HTTP_REQUEST_ID id, USHORT status, const char *reason, const char *code, const char *msg)
 {
-    char b[512];
-    sprintf_s(b, sizeof(b), "{\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", code, msg);
+    char esc[512];
+    char b[640];
+    json_escape(msg, esc, sizeof(esc));
+    sprintf_s(b, sizeof(b), "{\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", code, esc);
     send_json(id, status, reason, b);
 }
 

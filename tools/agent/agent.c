@@ -918,25 +918,61 @@ static BOOL user_session_ready(void)
 
 /* The share an existing drive letter points at, as the session sees it.
    Locale independent: Get-PSDrive's DisplayRoot is the UNC for a mapped drive. */
-static BOOL letter_maps_to_unc(char letter, const char *unc)
+static BOOL session_drive_target(char letter, char *out, size_t out_chars)
 {
     wchar_t cmd[512];
-    char out[512];
+    char raw[512];
     char *start, *end;
 
+    if (out_chars) out[0] = '\0';
     swprintf_s(cmd, ARRAYSIZE(cmd),
                L"powershell.exe -NoProfile -NonInteractive -Command "
                L"\"Get-PSDrive -Name %c | Select-Object -ExpandProperty DisplayRoot\"",
                letter);
-    if (run_as_session_user(cmd, 30000, out, sizeof(out)) != 0) return FALSE;
+    if (run_as_session_user(cmd, 30000, raw, sizeof(raw)) != 0) return FALSE;
 
-    start = out;
+    start = raw;
     while (*start == ' ' || *start == '\t') start++;
     end = start + strlen(start);
     while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
     *end = '\0';
+    if (*start == '\0' || start[0] != '\\' || start[1] != '\\') return FALSE;
 
-    return *start != '\0' && _stricmp(start, unc) == 0;
+    strncpy_s(out, out_chars, start, _TRUNCATE);
+    return TRUE;
+}
+
+static BOOL letter_maps_to_unc(char letter, const char *unc)
+{
+    char target[SHARE_FIELD_MAX];
+    return session_drive_target(letter, target, sizeof(target)) && _stricmp(target, unc) == 0;
+}
+
+/* Drop mappings to AppSandbox shares that are no longer configured: the
+   leftovers of the earlier duplicate-letter bug would otherwise keep an SMB
+   session (and its credentials) alive for the whole logon. */
+static void drop_orphan_mappings(char (*keep_uncs)[SHARE_FIELD_MAX], int keep_count)
+{
+    static const char candidates[] = "ZYXWVUTSRQ";
+    int i, j;
+
+    for (i = 0; candidates[i]; i++) {
+        char letter = candidates[i];
+        char target[SHARE_FIELD_MAX];
+        wchar_t cmd[256];
+        BOOL wanted = FALSE;
+
+        if (letter_free_in_user_session(letter)) continue;      /* nothing mapped */
+        if (!session_drive_target(letter, target, sizeof(target))) continue;
+        if (strstr(target, "\\AppSandbox.") == NULL) continue;  /* not one of ours */
+        for (j = 0; j < keep_count; j++)
+            if (_stricmp(target, keep_uncs[j]) == 0) { wanted = TRUE; break; }
+        if (wanted) continue;
+
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe use %c: /delete /y", letter);
+        (void)run_as_session_user(cmd, 30000, NULL, 0);
+        agent_log("Shares: dropped leftover mapping %c: (%s).", letter, target);
+    }
 }
 
 /* TRUE when this agent already holds a mapping on that letter. */
@@ -1230,15 +1266,25 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
             rc = -6;
 
             /* A permission problem will not fix itself: stop burning attempts
-               (and drive letters) on it and report it to the host. */
+               (and drive letters) on it and report it to the host. One exception
+               first: "access denied" right after mapping usually means the server
+               session still carries the credentials of an earlier configuration,
+               so tear that session down and give it one honest retry. */
             if (share_error_is_permanent(out_detail)) {
-                agent_log("Shares: %s is not accessible to %s; not retrying.",
-                          s->unc, s->user[0] ? s->user : "the signed-in user");
-                /* Keep the mapping (read access may still be useful) but do not
-                   spend more attempts on it. */
-                if (out_chars) { out_letter[0] = letter; out_letter[1] = '\0'; }
-                remember_mapping(letter, s->unc);
-                return rc;
+                if (!refreshed_session) {
+                    refreshed_session = TRUE;
+                    drop_server_mappings(server);
+                    agent_log("Shares: %s was denied; dropped the server session and trying again.",
+                              s->unc);
+                } else {
+                    agent_log("Shares: %s is not accessible to %s; not retrying.",
+                              s->unc, s->user[0] ? s->user : "the signed-in user");
+                    /* Keep the mapping (read access may still be useful) but do
+                       not spend more attempts on it. */
+                    if (out_chars) { out_letter[0] = letter; out_letter[1] = '\0'; }
+                    remember_mapping(letter, s->unc);
+                    return rc;
+                }
             }
         }
 
@@ -1313,6 +1359,7 @@ static DWORD WINAPI share_map_thread(LPVOID param)
         strncpy_s(keep[i], SHARE_FIELD_MAX, specs[i].unc, _TRUNCATE);
 
     unmap_stale_shares(keep, count);
+    drop_orphan_mappings(keep, count);
 
     for (i = 0; i < count; i++) {
         char letter[8] = "auto";

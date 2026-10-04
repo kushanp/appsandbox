@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 #include <lm.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <wchar.h>
 #include <ctype.h>
@@ -268,6 +269,38 @@ void asb_shares_name_for_vm(AsbHostShareList *list, const wchar_t *vm_name)
     }
 }
 
+/* Open the folder as the given token: proves both read and write, the way the
+   guest's mapped drive would see it. Returns FALSE and sets *err on denial. */
+static BOOL folder_access_as(HANDLE token, const wchar_t *path, DWORD *err)
+{
+    HANDLE dir;
+
+    *err = 0;
+    if (!ImpersonateLoggedOnUser(token)) {
+        *err = GetLastError();
+        return FALSE;
+    }
+    dir = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_ADD_FILE,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (dir == INVALID_HANDLE_VALUE) *err = GetLastError();
+    else CloseHandle(dir);
+    RevertToSelf();
+    return dir != INVALID_HANDLE_VALUE;
+}
+
+/* TRUE when the token carries the local Administrators group. */
+static BOOL token_is_admin(HANDLE token)
+{
+    PSID admins = NULL;
+    BOOL member = FALSE;
+
+    if (!ConvertStringSidToSidW(L"S-1-5-32-544", &admins)) return FALSE;
+    CheckTokenMembership(token, admins, &member);
+    LocalFree(admins);
+    return member;
+}
+
 /* ---- Validation ---- */
 
 /* Prove the share's account exists, the stored password is its password, and the
@@ -278,8 +311,9 @@ static const wchar_t *check_share_account(const AsbHostShare *s)
 {
     static wchar_t msg[512];
     wchar_t pass[256], account[192], domain[128], name[160], *slash;
-    HANDLE token = NULL, dir = NULL;
-    DWORD err;
+    HANDLE token = NULL, filtered = NULL;
+    BOOL have_filtered = FALSE, ok_filtered = FALSE, ok_plain = FALSE;
+    DWORD err, filtered_err = 0, plain_err = 0;
 
     /* An inherited password was checked when it was stored; re-checking it on
        every save would burn sign-in attempts against the account's lockout
@@ -345,30 +379,49 @@ static const wchar_t *check_share_account(const AsbHostShare *s)
     }
     SecureZeroMemory(pass, sizeof(pass));
 
-    /* NTFS rights decide what the guest can do, so ask the account directly. */
-    if (!ImpersonateLoggedOnUser(token)) {
-        err = GetLastError();
-        CloseHandle(token);
-        swprintf_s(msg, ARRAYSIZE(msg),
-            L"Could not check what \"%s\" can do in %s (error %lu).", s->user, s->host_path, err);
-        return msg;
+    /* NTFS rights decide what the guest can do, so ask the account directly --
+       with the same token shape the guest gets. UAC hands a network logon from a
+       local administrator a filtered token (the Administrators group is
+       deny-only), so a folder that only names Administrators looks fine from an
+       elevated process here and is denied inside the VM. */
+    if (CreateRestrictedToken(token, DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                              0, NULL, 0, NULL, 0, NULL, &filtered))
+        have_filtered = TRUE;
+    else
+        filtered = NULL;
+
+    ok_filtered = folder_access_as(have_filtered ? filtered : token, s->host_path, &filtered_err);
+    if (!ok_filtered && have_filtered) {
+        ok_plain = folder_access_as(token, s->host_path, &plain_err);
+        if (ok_plain) {
+            if (token_is_admin(token)) {
+                swprintf_s(msg, ARRAYSIZE(msg),
+                    L"The host account \"%s\" is a local administrator and that is the only way it can "
+                    L"open %s. Windows filters administrator rights over the network, so the guest's "
+                    L"drive would be denied. Grant the account explicit access, for example: "
+                    L"icacls \"%s\" /grant \"%s:(OI)(CI)M\".", s->user, s->host_path,
+                    s->host_path, s->user);
+            } else {
+                swprintf_s(msg, ARRAYSIZE(msg),
+                    L"The host account \"%s\" can open %s only through a group that Windows filters "
+                    L"over the network, so the guest's drive would be denied. Grant the account "
+                    L"explicit access to that folder.", s->user, s->host_path);
+            }
+            CloseHandle(filtered);
+            CloseHandle(token);
+            return msg;
+        }
     }
 
-    dir = CreateFileW(s->host_path, FILE_LIST_DIRECTORY | FILE_ADD_FILE,
-                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (dir == INVALID_HANDLE_VALUE) {
-        err = GetLastError();
-        RevertToSelf();
-        CloseHandle(token);
+    CloseHandle(filtered);   /* NULL is fine */
+    CloseHandle(token);
+
+    if (!ok_filtered) {
         swprintf_s(msg, ARRAYSIZE(msg),
             L"The host account \"%s\" cannot read and write %s (error %lu). "
-            L"Grant it access to that folder.", s->user, s->host_path, err);
+            L"Grant it access to that folder.", s->user, s->host_path, filtered_err);
         return msg;
     }
-    CloseHandle(dir);
-    RevertToSelf();
-    CloseHandle(token);
     return NULL;
 }
 

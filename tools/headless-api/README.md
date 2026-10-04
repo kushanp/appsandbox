@@ -363,10 +363,15 @@ Requirements and behavior:
   from NAT while shares exist.
 - The named account is checked when the list is saved: it must exist, match the
   password, and be able to read **and write** the folder, or the request comes
-  back `400` with the reason. That check spends one sign-in attempt against the
-  account's lockout policy, so a wrong password can lock the account (the guest
-  would spend the same attempts on its next boot). An entry sent **without** a
-  password reuses the stored one and is not re-checked.
+  back `400` with the reason. The check uses the same token shape the guest's
+  mapped drive gets, so a **local administrator** sharing a folder that grants
+  only the Administrators group is refused with the remedy
+  (`icacls <folder> /grant <account>:(OI)(CI)M`) instead of mapping and then
+  failing inside the guest: Windows marks the Administrators group deny-only for
+  network logons. That check spends one sign-in attempt against the account's
+  lockout policy, so a wrong password can lock the account (the guest would
+  spend the same attempts on its next boot). An entry sent **without** a password
+  reuses the stored one and is not re-checked.
 - The host share and its firewall rule (inbound TCP 445 from the VM subnet
   only) exist **while the VM runs** and are removed when it stops. Shares left
   behind by an unclean exit are removed at the next daemon start unless a
