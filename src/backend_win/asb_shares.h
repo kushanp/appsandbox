@@ -46,7 +46,10 @@ typedef struct {
 /* Validate a share list against a VM. Returns NULL when valid, otherwise a
    user-facing message (static storage). network_mode is the VM's mode: a
    shared drive needs NAT, because the guest reaches the host at the NAT
-   gateway. */
+   gateway. When the account's password is correct but the folder's ACL would
+   deny the guest's network logon (a local administrator loses the
+   Administrators group over SMB), this grants that account an inheritable
+   Modify entry so the mapped drive can be written. */
 ASB_API const wchar_t *asb_shares_validate(const AsbHostShareList *list, int network_mode);
 
 /* Fill in share names for entries that don't have one yet. vm_name is used to

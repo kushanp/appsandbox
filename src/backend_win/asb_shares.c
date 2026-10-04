@@ -13,6 +13,7 @@
 
 #include <windows.h>
 #include <wincrypt.h>
+#include <aclapi.h>
 #include <lm.h>
 #include <sddl.h>
 #include <stdio.h>
@@ -25,6 +26,7 @@
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "netapi32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 /* ---- Small helpers ---- */
 
@@ -269,51 +271,285 @@ void asb_shares_name_for_vm(AsbHostShareList *list, const wchar_t *vm_name)
     }
 }
 
-/* Open the folder as the given token: proves both read and write, the way the
-   guest's mapped drive would see it. Returns FALSE and sets *err on denial. */
-static BOOL folder_access_as(HANDLE token, const wchar_t *path, DWORD *err)
-{
-    HANDLE dir;
+/* The guest writes through an SMB session. A LogonUser NETWORK token is only
+   identification-level, so impersonating it and calling CreateFile fails with
+   error 1346 before the ACL is consulted, and a local administrator's SMB
+   session does not keep the Administrators group. Evaluate the directory DACL
+   against the network token's groups with those elevated groups deny-only.
+   That is the access the mapped drive actually has. */
 
-    *err = 0;
-    if (!ImpersonateLoggedOnUser(token)) {
-        *err = GetLastError();
-        return FALSE;
-    }
-    dir = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_ADD_FILE,
-                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (dir == INVALID_HANDLE_VALUE) *err = GetLastError();
-    else CloseHandle(dir);
-    RevertToSelf();
-    return dir != INVALID_HANDLE_VALUE;
+/* icacls "(OI)(CI)M": read, write, execute and delete, on this folder and on
+   files and subfolders created in it. */
+#define SHARE_MODIFY_MASK (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE)
+
+#define SMB_EXTRA_SIDS 4
+
+typedef struct {
+    PSID user;
+    PTOKEN_GROUPS groups;
+    PSID extra[SMB_EXTRA_SIDS];
+    int extra_count;
+    BOOL filter_admins;
+    BYTE extra_buf[SMB_EXTRA_SIDS][SECURITY_MAX_SID_SIZE];
+} SmbView;
+
+static DWORD reg_dword(const wchar_t *name, DWORD fallback)
+{
+    HKEY key;
+    DWORD val = fallback, cb = sizeof(val), type = 0;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return fallback;
+    if (RegQueryValueExW(key, name, NULL, &type, (BYTE *)&val, &cb) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+        val = fallback;
+    RegCloseKey(key);
+    return val;
 }
 
-/* TRUE when the token carries the local Administrators group. */
-static BOOL token_is_admin(HANDLE token)
+static BOOL is_nt_authority(PSID sid)
 {
-    PSID admins = NULL;
-    BOOL member = FALSE;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    return IsValidSid(sid) &&
+           memcmp(GetSidIdentifierAuthority(sid), &nt, sizeof(nt)) == 0;
+}
 
-    if (!ConvertStringSidToSidW(L"S-1-5-32-544", &admins)) return FALSE;
-    CheckTokenMembership(token, admins, &member);
-    LocalFree(admins);
-    return member;
+/* Groups UAC removes from a local administrator's network token. An allow ACE
+   for one of these does not let the guest write; a deny ACE still does. */
+static BOOL is_elevated_group(PSID sid)
+{
+    PUCHAR count;
+    DWORD domain, rid;
+
+    if (!is_nt_authority(sid)) return FALSE;
+    count = GetSidSubAuthorityCount(sid);
+    if (*count < 2) return FALSE;
+    domain = *GetSidSubAuthority(sid, 0);
+    rid = *GetSidSubAuthority(sid, *count - 1);
+    if (domain == SECURITY_BUILTIN_DOMAIN_RID) {
+        return rid == DOMAIN_ALIAS_RID_ADMINS ||
+               rid == DOMAIN_ALIAS_RID_POWER_USERS ||
+               rid == DOMAIN_ALIAS_RID_ACCOUNT_OPS ||
+               rid == DOMAIN_ALIAS_RID_SYSTEM_OPS ||
+               rid == DOMAIN_ALIAS_RID_PRINT_OPS ||
+               rid == DOMAIN_ALIAS_RID_BACKUP_OPS ||
+               rid == DOMAIN_ALIAS_RID_NETWORK_CONFIGURATION_OPS ||
+               rid == DOMAIN_ALIAS_RID_CRYPTO_OPERATORS;
+    }
+    if (domain == SECURITY_NT_NON_UNIQUE) {
+        return rid == DOMAIN_GROUP_RID_ADMINS ||
+               rid == DOMAIN_GROUP_RID_SCHEMA_ADMINS ||
+               rid == DOMAIN_GROUP_RID_ENTERPRISE_ADMINS;
+    }
+    return FALSE;
+}
+
+static BOOL is_local_builtin_admin(PSID user)
+{
+    wchar_t name[256], domain[256], computer[256];
+    DWORD name_len = ARRAYSIZE(name), domain_len = ARRAYSIZE(domain);
+    DWORD computer_len = ARRAYSIZE(computer);
+    SID_NAME_USE use;
+    PUCHAR count;
+
+    count = GetSidSubAuthorityCount(user);
+    if (!count || *count < 1) return FALSE;
+    if (*GetSidSubAuthority(user, *count - 1) != DOMAIN_USER_RID_ADMIN) return FALSE;
+    if (!LookupAccountSidW(NULL, user, name, &name_len, domain, &domain_len, &use))
+        return FALSE;
+    if (!GetComputerNameW(computer, &computer_len)) return FALSE;
+    return _wcsicmp(domain, computer) == 0;
+}
+
+static BOOL network_filters_admins(PSID user, const PTOKEN_GROUPS groups)
+{
+    DWORD i;
+
+    if (reg_dword(L"EnableLUA", 1) == 0) return FALSE;
+    if (reg_dword(L"LocalAccountTokenFilterPolicy", 0) == 1) return FALSE;
+    if (is_local_builtin_admin(user) && reg_dword(L"FilterAdministratorToken", 0) == 0)
+        return FALSE;
+    if (!groups) return FALSE;
+    for (i = 0; i < groups->GroupCount; i++) {
+        PSID sid = groups->Groups[i].Sid;
+        if (sid && (groups->Groups[i].Attributes & SE_GROUP_ENABLED) && is_elevated_group(sid))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void smb_view_add_well_known(SmbView *view, WELL_KNOWN_SID_TYPE type)
+{
+    DWORD n;
+
+    if (view->extra_count >= SMB_EXTRA_SIDS) return;
+    n = SECURITY_MAX_SID_SIZE;
+    if (!CreateWellKnownSid(type, NULL, view->extra_buf[view->extra_count], &n)) return;
+    view->extra[view->extra_count] = (PSID)view->extra_buf[view->extra_count];
+    view->extra_count++;
+}
+
+static BOOL sid_in_view(const SmbView *view, PSID sid, BOOL deny)
+{
+    DWORD i;
+    int e;
+
+    if (!sid || !IsValidSid(sid)) return FALSE;
+    if (view->user && EqualSid(sid, view->user)) return TRUE;
+    if (view->groups) {
+        for (i = 0; i < view->groups->GroupCount; i++) {
+            SID_AND_ATTRIBUTES *g = &view->groups->Groups[i];
+            if (!g->Sid || !IsValidSid(g->Sid) || !EqualSid(g->Sid, sid)) continue;
+            /* Elevated groups are deny-only on the guest's SMB session. */
+            if (view->filter_admins && is_elevated_group(sid)) return deny;
+            if (g->Attributes & SE_GROUP_ENABLED) return TRUE;
+            if (deny && (g->Attributes & SE_GROUP_USE_FOR_DENY_ONLY)) return TRUE;
+            return FALSE;
+        }
+    }
+    for (e = 0; e < view->extra_count; e++)
+        if (EqualSid(view->extra[e], sid)) return TRUE;
+    return FALSE;
+}
+
+static DWORD map_generic_file(DWORD mask)
+{
+    DWORD out = mask;
+
+    if (mask & GENERIC_ALL) {
+        out &= ~GENERIC_ALL;
+        out |= FILE_ALL_ACCESS;
+    }
+    if (mask & GENERIC_READ) {
+        out &= ~GENERIC_READ;
+        out |= FILE_GENERIC_READ;
+    }
+    if (mask & GENERIC_WRITE) {
+        out &= ~GENERIC_WRITE;
+        out |= FILE_GENERIC_WRITE;
+    }
+    if (mask & GENERIC_EXECUTE) {
+        out &= ~GENERIC_EXECUTE;
+        out |= FILE_GENERIC_EXECUTE;
+    }
+    return out;
+}
+
+/* 1 = granted, 0 = not granted, -1 = an explicit deny blocks it.
+   for_file evaluates the ACL a new file in the folder would inherit. The
+   guest probe creates a file, reads it back and deletes it. */
+static int acl_result(const SmbView *view, PACL acl, DWORD desired, BOOL for_file,
+                      PSID creator_owner)
+{
+    DWORD i, still = desired;
+
+    if (!acl) return 1;   /* NULL DACL grants everyone full control */
+    for (i = 0; i < acl->AceCount; i++) {
+        ACE_HEADER *header;
+        ACCESS_ALLOWED_ACE *ace;
+        PSID sid, match;
+        BOOL denied;
+        DWORD mask;
+
+        if (!GetAce(acl, i, (LPVOID *)&header)) continue;
+        denied = header->AceType == ACCESS_DENIED_ACE_TYPE;
+        if (!denied && header->AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
+        if (for_file) {
+            if ((header->AceFlags & OBJECT_INHERIT_ACE) == 0) continue;
+        } else if (header->AceFlags & INHERIT_ONLY_ACE) {
+            continue;
+        }
+
+        ace = (ACCESS_ALLOWED_ACE *)header;
+        sid = (PSID)&ace->SidStart;
+        if (!IsValidSid(sid)) continue;
+        match = sid;
+        /* A new file is owned by the account that creates it. */
+        if (for_file && creator_owner && EqualSid(sid, creator_owner))
+            match = view->user;
+        if (!sid_in_view(view, match, denied)) continue;
+
+        mask = map_generic_file(ace->Mask);
+        if (denied) {
+            if (mask & still) return -1;
+            continue;
+        }
+        still &= ~mask;
+        if (still == 0) return 1;
+    }
+    return 0;
+}
+
+static int smb_folder_access(const SmbView *view, PACL dacl)
+{
+    BYTE creator[SECURITY_MAX_SID_SIZE];
+    DWORD creator_len = sizeof(creator);
+    PSID creator_owner = NULL;
+    int dir, file;
+
+    if (CreateWellKnownSid(WinCreatorOwnerSid, NULL, creator, &creator_len))
+        creator_owner = (PSID)creator;
+    dir = acl_result(view, dacl, FILE_LIST_DIRECTORY | FILE_ADD_FILE, FALSE, NULL);
+    file = acl_result(view, dacl,
+                      FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+                      DELETE | SYNCHRONIZE,
+                      TRUE, creator_owner);
+    if (dir < 0 || file < 0) return -1;
+    if (dir == 0 || file == 0) return 0;
+    return 1;
+}
+
+/* Add an explicit inheritable Modify ACE for the share account. This is the
+   same grant that makes an administrator-only folder writable from the VM. */
+static DWORD grant_share_modify(const wchar_t *path, PSID user)
+{
+    EXPLICIT_ACCESSW access;
+    PACL old_dacl = NULL, new_dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD rc;
+
+    ZeroMemory(&access, sizeof(access));
+    access.grfAccessPermissions = SHARE_MODIFY_MASK;
+    access.grfAccessMode = GRANT_ACCESS;
+    access.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    access.Trustee.ptstrName = (LPWSTR)user;
+
+    rc = GetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                               NULL, NULL, &old_dacl, NULL, &sd);
+    if (rc == ERROR_SUCCESS)
+        rc = SetEntriesInAclW(1, &access, old_dacl, &new_dacl);
+    if (sd) LocalFree(sd);
+    if (rc == ERROR_SUCCESS)
+        rc = SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                   NULL, NULL, new_dacl, NULL);
+    if (new_dacl) LocalFree(new_dacl);
+    return rc;
 }
 
 /* ---- Validation ---- */
 
 /* Prove the share's account exists, the stored password is its password, and the
-   account can actually open the folder. Catching this here reports the problem
-   in the UI instead of as a failed drive mapping inside the guest later.
-   Returns NULL when the share is usable, otherwise a message. */
+   guest's SMB session can create, read and delete a file in the folder. When
+   the password is right but the ACL would deny that session, grant the account
+   an inheritable Modify entry (the guest drops administrator rights). Returns
+   NULL when the share is usable, otherwise a message. */
 static const wchar_t *check_share_account(const AsbHostShare *s)
 {
-    static wchar_t msg[512];
+    static wchar_t msg[1024];
     wchar_t pass[256], account[192], domain[128], name[160], *slash;
-    HANDLE token = NULL, filtered = NULL;
-    BOOL have_filtered = FALSE, ok_filtered = FALSE, ok_plain = FALSE;
-    DWORD err, filtered_err = 0, plain_err = 0;
+    HANDLE token = NULL;
+    DWORD err, need = 0;
+    BYTE user_buf[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)];
+    TOKEN_USER *token_user;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    PTOKEN_GROUPS groups = NULL;
+    SmbView view;
+    int access;
 
     /* An inherited password was checked when it was stored; re-checking it on
        every save would burn sign-in attempts against the account's lockout
@@ -379,50 +615,81 @@ static const wchar_t *check_share_account(const AsbHostShare *s)
     }
     SecureZeroMemory(pass, sizeof(pass));
 
-    /* NTFS rights decide what the guest can do, so ask the account directly --
-       with the same token shape the guest gets. UAC hands a network logon from a
-       local administrator a filtered token (the Administrators group is
-       deny-only), so a folder that only names Administrators looks fine from an
-       elevated process here and is denied inside the VM. */
-    if (CreateRestrictedToken(token, DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
-                              0, NULL, 0, NULL, 0, NULL, &filtered))
-        have_filtered = TRUE;
-    else
-        filtered = NULL;
-
-    ok_filtered = folder_access_as(have_filtered ? filtered : token, s->host_path, &filtered_err);
-    if (!ok_filtered && have_filtered) {
-        ok_plain = folder_access_as(token, s->host_path, &plain_err);
-        if (ok_plain) {
-            if (token_is_admin(token)) {
-                swprintf_s(msg, ARRAYSIZE(msg),
-                    L"The host account \"%s\" is a local administrator and that is the only way it can "
-                    L"open %s. Windows filters administrator rights over the network, so the guest's "
-                    L"drive would be denied. Grant the account explicit access, for example: "
-                    L"icacls \"%s\" /grant \"%s:(OI)(CI)M\".", s->user, s->host_path,
-                    s->host_path, s->user);
-            } else {
-                swprintf_s(msg, ARRAYSIZE(msg),
-                    L"The host account \"%s\" can open %s only through a group that Windows filters "
-                    L"over the network, so the guest's drive would be denied. Grant the account "
-                    L"explicit access to that folder.", s->user, s->host_path);
-            }
-            CloseHandle(filtered);
-            CloseHandle(token);
-            return msg;
-        }
-    }
-
-    CloseHandle(filtered);   /* NULL is fine */
-    CloseHandle(token);
-
-    if (!ok_filtered) {
+    ZeroMemory(&view, sizeof(view));
+    if (!GetTokenInformation(token, TokenUser, user_buf, sizeof(user_buf), &need)) {
+        err = GetLastError();
+        CloseHandle(token);
         swprintf_s(msg, ARRAYSIZE(msg),
-            L"The host account \"%s\" cannot read and write %s (error %lu). "
-            L"Grant it access to that folder.", s->user, s->host_path, filtered_err);
+            L"The host account \"%s\" could not be used (error %lu).", s->user, err);
         return msg;
     }
-    return NULL;
+    token_user = (TOKEN_USER *)user_buf;
+    view.user = token_user->User.Sid;
+
+    GetTokenInformation(token, TokenGroups, NULL, 0, &need);
+    if (need) {
+        groups = (PTOKEN_GROUPS)HeapAlloc(GetProcessHeap(), 0, need);
+        if (groups && GetTokenInformation(token, TokenGroups, groups, need, &need))
+            view.groups = groups;
+    }
+    view.filter_admins = network_filters_admins(view.user, view.groups);
+    /* A network logon is also Everyone, Authenticated Users, Users and NETWORK,
+       even when the token's group list does not spell each of those out. */
+    smb_view_add_well_known(&view, WinWorldSid);
+    smb_view_add_well_known(&view, WinAuthenticatedUserSid);
+    smb_view_add_well_known(&view, WinBuiltinUsersSid);
+    smb_view_add_well_known(&view, WinNetworkSid);
+    CloseHandle(token);
+    token = NULL;
+
+    err = GetNamedSecurityInfoW((LPWSTR)s->host_path, SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd);
+    if (err != ERROR_SUCCESS) {
+        if (groups) HeapFree(GetProcessHeap(), 0, groups);
+        swprintf_s(msg, ARRAYSIZE(msg),
+            L"Could not read the permissions on %s (error %lu).", s->host_path, err);
+        return msg;
+    }
+    access = smb_folder_access(&view, dacl);
+    LocalFree(sd);
+    sd = NULL;
+
+    if (access == 0) {
+        /* No allow entry covers the guest. Add one, then check again so a
+           protected or deny-only ACL is not reported as shared. */
+        err = grant_share_modify(s->host_path, view.user);
+        if (err != ERROR_SUCCESS) {
+            if (groups) HeapFree(GetProcessHeap(), 0, groups);
+            swprintf_s(msg, ARRAYSIZE(msg),
+                L"The host account \"%s\" cannot write %s from the VM, and AppSandbox "
+                L"could not grant it access (error %lu). Grant it yourself: "
+                L"icacls \"%s\" /grant \"%s:(OI)(CI)M\".",
+                s->user, s->host_path, err, s->host_path, s->user);
+            return msg;
+        }
+        err = GetNamedSecurityInfoW((LPWSTR)s->host_path, SE_FILE_OBJECT,
+                                    DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd);
+        access = (err == ERROR_SUCCESS) ? smb_folder_access(&view, dacl) : 0;
+        if (sd) LocalFree(sd);
+        if (access == 1)
+            ui_log(L"Granted %s Modify on %s so the VM can write the shared folder.",
+                   s->user, s->host_path);
+    }
+
+    if (groups) HeapFree(GetProcessHeap(), 0, groups);
+
+    if (access == 1) return NULL;
+    if (access < 0) {
+        swprintf_s(msg, ARRAYSIZE(msg),
+            L"The host account \"%s\" is denied access to %s. Remove that deny entry, "
+            L"or choose a different folder.", s->user, s->host_path);
+        return msg;
+    }
+    swprintf_s(msg, ARRAYSIZE(msg),
+        L"The host account \"%s\" still cannot write %s from the VM. Grant it yourself: "
+        L"icacls \"%s\" /grant \"%s:(OI)(CI)M\".",
+        s->user, s->host_path, s->host_path, s->user);
+    return msg;
 }
 
 const wchar_t *asb_shares_validate(const AsbHostShareList *list, int network_mode)
