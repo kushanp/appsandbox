@@ -237,7 +237,9 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         if (vm->share_retries < 12 && vm->host_shares.count > 0) {
             int i, pending = 0;
             for (i = 0; i < vm->host_shares.count; i++)
-                if (vm->share_state[i] != 1) pending++;
+                /* A share the guest cannot access at all will not start working
+                   because we asked again, so it does not keep the retries alive. */
+                if (vm->share_state[i] != 1 && !vm->share_terminal[i]) pending++;
             if (pending > 0 && GetTickCount64() - vm->share_last_send > 20000) {
                 vm->share_retries++;
                 ui_log(L"Retrying %d shared folder(s) for \"%s\" (attempt %u of 12).",
@@ -316,6 +318,16 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
                       letter, _TRUNCATE);
             wcsncpy_s(vm->share_detail[idx], ARRAYSIZE(vm->share_detail[idx]),
                       result, _TRUNCATE);
+            /* "Access is denied" is a permission problem: retrying cannot fix
+               it, so record it and let the retry loop ignore this share. */
+            if (vm->share_state[idx] == 2 && !vm->share_terminal[idx] &&
+                (wcsstr(result, L"Access is denied") || wcsstr(result, L"error:5:"))) {
+                vm->share_terminal[idx] = TRUE;
+                ui_log(L"Shared folder \"%s\" in \"%s\" cannot be accessed by the guest; "
+                       L"not retrying it.", vm->host_shares.items[idx].host_path, vm->name);
+            } else if (vm->share_state[idx] == 1) {
+                vm->share_terminal[idx] = FALSE;
+            }
         }
         ui_log(L"[%s] Shared folder: %S", vm->name, buf + 13);
         notify_agent_status(vm);
@@ -518,6 +530,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             vm->share_last_send = 0;
             for (si = 0; si < ASB_MAX_HOST_SHARES; si++) {
                 vm->share_state[si] = 0;
+                vm->share_terminal[si] = FALSE;
                 vm->share_letter[si][0] = L'\0';
                 vm->share_detail[si][0] = L'\0';
             }

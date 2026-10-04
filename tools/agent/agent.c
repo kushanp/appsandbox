@@ -721,8 +721,11 @@ static HostShareMap g_share_map;
 static CRITICAL_SECTION g_share_cs;
 static BOOL g_share_cs_ready = FALSE;
 
-#define SHARE_REG_KEY    L"SOFTWARE\\AppSandbox"
-#define SHARE_REG_VALUE  L"MappedShares"
+/* The mappings this agent created, so a later round recognises them instead of
+   making a second drive for the same share. Kept in the agent's own directory:
+   the service account has no write access to HKLM\SOFTWARE, which is why an
+   earlier registry-based attempt silently stored nothing. */
+#define SHARE_MAP_FILE   "C:\\Windows\\AppSandbox\\shares.map"
 
 /* Run a command line in the interactive user's session (WinSta0\Default).
    stdout/stderr are captured into out (newlines collapsed to spaces) so a
@@ -827,64 +830,47 @@ static BOOL letter_free_in_user_session(char letter)
 }
 
 /* Previous mappings, so a share removed from the VM config also loses its
-   drive letter. Stored as REG_MULTI_SZ entries "L|\\host\share". */
+   drive letter, and so a share that is already mapped is recognised. One
+   "L|\\host\share" line per mapping, UTF-8. */
 static int shares_load_mapped(wchar_t entries[][SHARE_FIELD_MAX], int max)
 {
-    HKEY key;
-    DWORD type = 0, size = 0;
+    FILE *f;
+    char line[SHARE_FIELD_MAX * 2];
     int count = 0;
-    wchar_t *buf;
-    const wchar_t *p;
 
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, SHARE_REG_KEY, 0, KEY_QUERY_VALUE, &key)
-            != ERROR_SUCCESS)
-        return 0;
+    if (fopen_s(&f, SHARE_MAP_FILE, "r") != 0 || !f) return 0;
 
-    if (RegQueryValueExW(key, SHARE_REG_VALUE, NULL, &type, NULL, &size)
-            == ERROR_SUCCESS && type == REG_MULTI_SZ && size >= sizeof(wchar_t)) {
-        buf = (wchar_t *)malloc(size);
-        if (buf && RegQueryValueExW(key, SHARE_REG_VALUE, NULL, &type,
-                                    (BYTE *)buf, &size) == ERROR_SUCCESS) {
-            p = buf;
-            while (*p && count < max) {
-                wcsncpy_s(entries[count], SHARE_FIELD_MAX, p, _TRUNCATE);
-                count++;
-                p += wcslen(p) + 1;
-            }
-        }
-        free(buf);
+    while (count < max && fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (len == 0 || strchr(line, '|') == NULL) continue;
+        if (MultiByteToWideChar(CP_UTF8, 0, line, -1, entries[count], SHARE_FIELD_MAX) <= 0)
+            continue;
+        count++;
     }
-    RegCloseKey(key);
+    fclose(f);
     return count;
 }
 
 static void shares_save_mapped(wchar_t entries[][SHARE_FIELD_MAX], int count)
 {
-    HKEY key;
-    DWORD size = sizeof(wchar_t);
-    BYTE *buf;
-    wchar_t *p;
-    int i;
+    FILE *f;
+    char line[SHARE_FIELD_MAX * 2];
+    int i, written = 0;
 
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, SHARE_REG_KEY, 0, NULL, 0,
-                        KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+    if (fopen_s(&f, SHARE_MAP_FILE, "w") != 0 || !f) {
+        agent_log("Shares: could not write %s (%lu).", SHARE_MAP_FILE, GetLastError());
         return;
-
-    for (i = 0; i < count; i++)
-        size += (DWORD)(wcslen(entries[i]) + 1) * sizeof(wchar_t);
-
-    buf = (BYTE *)calloc(1, size);
-    if (buf) {
-        p = (wchar_t *)buf;
-        for (i = 0; i < count; i++) {
-            size_t n = (wcslen(entries[i]) + 1) * sizeof(wchar_t);
-            memcpy(p, entries[i], n);
-            p += n / sizeof(wchar_t);
-        }
-        RegSetValueExW(key, SHARE_REG_VALUE, 0, REG_MULTI_SZ, buf, size);
-        free(buf);
     }
-    RegCloseKey(key);
+    for (i = 0; i < count; i++) {
+        if (WideCharToMultiByte(CP_UTF8, 0, entries[i], -1, line, sizeof(line), NULL, NULL) <= 0)
+            continue;
+        fprintf(f, "%s\n", line);
+        written++;
+    }
+    fclose(f);
+    if (count > 0 && written == 0)
+        agent_log("Shares: nothing could be written to %s.", SHARE_MAP_FILE);
 }
 
 static void shares_send(const char *line)
@@ -893,21 +879,211 @@ static void shares_send(const char *line)
         send_line(g_share_map.notify_conn, line);
 }
 
+/* Letter this agent already mapped to that share path, or 0 when none. Also
+   says whether the letter is one of ours, so an auto pick never steals it. */
+static char stored_letter_for_unc(const char *unc, BOOL *in_use){
+    wchar_t entries[MAX_HOST_SHARES][SHARE_FIELD_MAX];
+    int count, i;
+    char found = 0;
+
+    if (in_use) *in_use = FALSE;
+    count = shares_load_mapped(entries, MAX_HOST_SHARES);
+    for (i = 0; i < count; i++) {
+        wchar_t *bar = wcschr(entries[i], L'|');
+        char stored[SHARE_FIELD_MAX];
+        if (!bar) continue;
+        WideCharToMultiByte(CP_UTF8, 0, bar + 1, -1, stored, sizeof(stored), NULL, NULL);
+        if (_stricmp(stored, unc) == 0) {
+            found = (char)entries[i][0];
+            if (in_use) *in_use = TRUE;
+            break;
+        }
+    }
+    return found;
+}
+
+/* TRUE when the interactive session exists and its token can be taken. Mappings
+   live in that session, so until the user is logged on there is nothing to map
+   into - and saying "no free drive letter" for that told the user nothing. */
+static BOOL user_session_ready(void)
+{
+    DWORD session = WTSGetActiveConsoleSessionId();
+    HANDLE token = NULL;
+
+    if (session == 0xFFFFFFFF) return FALSE;
+    if (!WTSQueryUserToken(session, &token)) return FALSE;
+    CloseHandle(token);
+    return TRUE;
+}
+
+/* The share an existing drive letter points at, as the session sees it.
+   Locale independent: Get-PSDrive's DisplayRoot is the UNC for a mapped drive. */
+static BOOL letter_maps_to_unc(char letter, const char *unc)
+{
+    wchar_t cmd[512];
+    char out[512];
+    char *start, *end;
+
+    swprintf_s(cmd, ARRAYSIZE(cmd),
+               L"powershell.exe -NoProfile -NonInteractive -Command "
+               L"\"Get-PSDrive -Name %c | Select-Object -ExpandProperty DisplayRoot\"",
+               letter);
+    if (run_as_session_user(cmd, 30000, out, sizeof(out)) != 0) return FALSE;
+
+    start = out;
+    while (*start == ' ' || *start == '\t') start++;
+    end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+    *end = '\0';
+
+    return *start != '\0' && _stricmp(start, unc) == 0;
+}
+
+/* TRUE when this agent already holds a mapping on that letter. */
+static BOOL letter_is_ours(char letter)
+{
+    wchar_t entries[MAX_HOST_SHARES][SHARE_FIELD_MAX];
+    int count = shares_load_mapped(entries, MAX_HOST_SHARES), i;
+    for (i = 0; i < count; i++)
+        if ((char)entries[i][0] == letter) return TRUE;
+    return FALSE;
+}
+
+/* Record (or update) the mapping this agent made, so later rounds can see it
+   and never create a second drive for the same share. */
+static void remember_mapping(char letter, const char *unc)
+{
+    wchar_t entries[MAX_HOST_SHARES][SHARE_FIELD_MAX];
+    wchar_t lines[MAX_HOST_SHARES][SHARE_FIELD_MAX];
+    wchar_t wide[SHARE_FIELD_MAX];
+    int count, i, kept = 0;
+    BOOL replaced = FALSE;
+
+    MultiByteToWideChar(CP_UTF8, 0, unc, -1, wide, ARRAYSIZE(wide));
+    count = shares_load_mapped(entries, MAX_HOST_SHARES);
+    for (i = 0; i < count; i++) {
+        wchar_t *bar = wcschr(entries[i], L'|');
+        char stored[SHARE_FIELD_MAX];
+        if (!bar) continue;
+        WideCharToMultiByte(CP_UTF8, 0, bar + 1, -1, stored, sizeof(stored), NULL, NULL);
+        if (_stricmp(stored, unc) == 0) {
+            swprintf_s(lines[kept], SHARE_FIELD_MAX, L"%c|%s", letter, wide);
+            replaced = TRUE;
+        } else {
+            wcsncpy_s(lines[kept], SHARE_FIELD_MAX, entries[i], _TRUNCATE);
+        }
+        kept++;
+    }
+    if (!replaced && kept < MAX_HOST_SHARES) {
+        swprintf_s(lines[kept], SHARE_FIELD_MAX, L"%c|%s", letter, wide);
+        kept++;
+    }
+    shares_save_mapped(lines, kept);
+}
+
+/* Verify a drive that should already be mapped: used to recognise our own
+   earlier mapping instead of creating a second one for the same share. */
+static int probe_letter(char letter, char *out_detail, size_t detail_chars)
+{
+    wchar_t cmd[512];
+    char probe[64];
+
+    sprintf_s(probe, sizeof(probe), "asb%08lx%08lx",
+              (unsigned long)GetTickCount(), (unsigned long)rand());
+    swprintf_s(cmd, ARRAYSIZE(cmd),
+               L"cmd.exe /c echo %S > %c:\\AppSandbox-share-probe.txt"
+               L" && findstr.exe /c:%S %c:\\AppSandbox-share-probe.txt >nul"
+               L" && del %c:\\AppSandbox-share-probe.txt",
+               probe, letter, probe, letter, letter);
+    if (run_as_session_user(cmd, 60000, out_detail, detail_chars) == 0) {
+        if (out_detail && detail_chars) sprintf_s(out_detail, detail_chars, "probe=%s", probe);
+        return 0;
+    }
+    return -6;
+}
+
+/* TRUE when a net.exe/cmd failure will not fix itself by retrying. */
+static BOOL share_error_is_permanent(const char *detail)
+{
+    if (!detail) return FALSE;
+    /* net.exe reports numeric System error codes, which are locale independent. */
+    return strstr(detail, "System error 5 ") != NULL ||
+           strstr(detail, "System error 1327") != NULL ||
+           strstr(detail, "Access is denied") != NULL;
+}
+
+/* TRUE for the failures that mean the SMB session itself is unusable (wrong or
+   conflicting credentials). Dropping every mapping to that server is the only
+   way to force a fresh, correctly authenticated session. */
+static BOOL share_error_is_session(const char *detail)
+{
+    if (!detail) return FALSE;
+    return strstr(detail, "System error 86") != NULL ||    /* bad password */
+           strstr(detail, "System error 1219") != NULL ||  /* conflicting credentials */
+           strstr(detail, "System error 1326") != NULL ||  /* logon failure */
+           strstr(detail, "System error 1909") != NULL;    /* locked out */
+}
+
+/* Delete every mapping this agent holds to that server, so the next net use
+   starts a new session with the configured credentials. */
+static void drop_server_mappings(const char *server)
+{
+    wchar_t entries[MAX_HOST_SHARES][SHARE_FIELD_MAX];
+    wchar_t remaining[MAX_HOST_SHARES][SHARE_FIELD_MAX];
+    int count = shares_load_mapped(entries, MAX_HOST_SHARES), i, kept = 0;
+
+    for (i = 0; i < count; i++) {
+        wchar_t *bar = wcschr(entries[i], L'|');
+        char unc[SHARE_FIELD_MAX];
+        char letter = (char)entries[i][0];
+        wchar_t cmd[600];
+        size_t n = 0;
+
+        if (bar) {
+            WideCharToMultiByte(CP_UTF8, 0, bar + 1, -1, unc, sizeof(unc), NULL, NULL);
+            /* Same server? UNC is \\server\share. */
+            if (strncmp(unc, "\\\\", 2) == 0) {
+                const char *srv = unc + 2;
+                size_t len = strcspn(srv, "\\");
+                if (len == strlen(server) && _strnicmp(srv, server, len) == 0) n = 1;
+            }
+        }
+
+        if (!n) {
+            wcsncpy_s(remaining[kept++], SHARE_FIELD_MAX, entries[i], _TRUNCATE);
+            continue;
+        }
+
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe use %c: /delete /y", letter);
+        (void)run_as_session_user(cmd, 30000, NULL, 0);
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe use %S /delete /y", unc);
+        (void)run_as_session_user(cmd, 30000, NULL, 0);
+        agent_log("Shares: dropped mapping %c: to %s to refresh the session.", letter, server);
+    }
+
+    shares_save_mapped(remaining, kept);
+}
+
 /* Map one share and probe it, retrying while the guest network settles (the
    host reconfigures the NIC moments before it sends the list). Returns 0 on
    success; on failure the reason and the last command output go to out_detail.
-   The chosen letter is copied to out_letter. */
+   The chosen letter is copied to out_letter.
+
+   Calling this twice for the same share must not create a second drive: an
+   existing mapping for the same path is reused and only re-verified. */
 static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_chars,
                          char *out_detail, size_t detail_chars)
 {
     wchar_t cmd[2048];
     char server[128];
     char letter = 0;
+    char stored = 0;
     char probe[64];
     const char *p;
     size_t n;
     int rc = -1, attempt;
     const int max_attempts = 6;
+    BOOL refreshed_session = FALSE;
 
     if (out_detail && detail_chars) out_detail[0] = '\0';
 
@@ -920,13 +1096,63 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
     memcpy(server, s->unc + 2, n);
     server[n] = '\0';
 
-    if (_stricmp(s->letter, "auto") == 0) {
+    stored = stored_letter_for_unc(s->unc, NULL);
+
+    /* Nothing can be mapped before the guest's user session is logged on. */
+    if (!user_session_ready()) {
+        if (out_detail && detail_chars)
+            strncpy_s(out_detail, detail_chars,
+                      "the VM's user session is not ready yet", _TRUNCATE);
+        return -7;
+    }
+
+    /* A letter that already points at this share must be reused. Without this,
+       a second round (or Windows reconnecting the persistent mapping at logon)
+       made the next free letter the target and the same folder ended up on
+       several drives. */
+    if (!stored) {
         static const char candidates[] = "ZYXWVUTSRQ";
         int i;
         for (i = 0; candidates[i]; i++) {
-            if (letter_free_in_user_session(candidates[i])) {
-                letter = candidates[i];
+            if (!letter_free_in_user_session(candidates[i]) &&
+                letter_maps_to_unc(candidates[i], s->unc)) {
+                stored = candidates[i];
+                agent_log("Shares: %s is already on %c:.", s->unc, stored);
                 break;
+            }
+        }
+    }
+
+    /* Already mapped by an earlier round (or an earlier connection): reuse that
+       letter and just confirm it still works. */
+    if (stored) {
+        char detail[200] = "";
+        rc = probe_letter(stored, detail, sizeof(detail));
+        if (rc == 0) {
+            if (out_chars) { out_letter[0] = stored; out_letter[1] = '\0'; }
+            if (out_detail && detail_chars) strncpy_s(out_detail, detail_chars, detail, _TRUNCATE);
+            remember_mapping(stored, s->unc);
+            agent_log("Shares: %s already mapped to %c: (%s).", s->unc, stored, detail);
+            return 0;
+        }
+        agent_log("Shares: existing mapping %c: for %s did not verify (%s); remapping.",
+                  stored, s->unc, detail);
+    }
+
+    if (_stricmp(s->letter, "auto") == 0) {
+        static const char candidates[] = "ZYXWVUTSRQ";
+        int i;
+        if (stored) {
+            letter = stored;      /* keep the letter this share already had */
+        } else {
+            for (i = 0; candidates[i]; i++) {
+                /* Never take a letter this agent mapped before: that is how one
+                   share used to end up on five drives. */
+                if (letter_free_in_user_session(candidates[i]) &&
+                    !letter_is_ours(candidates[i])) {
+                    letter = candidates[i];
+                    break;
+                }
             }
         }
     } else {
@@ -934,6 +1160,8 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
     }
     if (!letter) {
         agent_log("Shares: no free drive letter for %s.", s->unc);
+        if (out_detail && detail_chars)
+            strncpy_s(out_detail, detail_chars, "no free drive letter", _TRUNCATE);
         return -2;
     }
 
@@ -944,6 +1172,13 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
         agent_log("Shares: password for %s contains a double quote.", server);
         return -3;
     }
+
+    /* Start from a clean slate: the letter may be held by a stale mapping and
+       the server may hold a session with different credentials. */
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe use %c: /delete /y", letter);
+    (void)run_as_session_user(cmd, 30000, NULL, 0);
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe use %S /delete /y", s->unc);
+    (void)run_as_session_user(cmd, 30000, NULL, 0);
 
     for (attempt = 1; attempt <= max_attempts; attempt++) {
         rc = -5;
@@ -961,6 +1196,12 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
             agent_log("Shares: net use %c: attempt %d/%d failed (exit %d) %s",
                       letter, attempt, max_attempts, rc,
                       out_detail ? out_detail : "");
+            /* A session with the wrong credentials keeps every later attempt
+               from authenticating, so tear the whole server session down once. */
+            if (!refreshed_session && share_error_is_session(out_detail)) {
+                refreshed_session = TRUE;
+                drop_server_mappings(server);
+            }
         } else {
             /* Write a marker through the new drive and read it back, so "ok"
                means the mapping is usable and writable, not merely created. */
@@ -979,6 +1220,7 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
                 }
                 if (out_detail && detail_chars)
                     sprintf_s(out_detail, detail_chars, "probe=%s", probe);
+                remember_mapping(letter, s->unc);
                 agent_log("Shares: %s mapped to %c: (probe %s).", s->unc, letter, probe);
                 return 0;
             }
@@ -986,6 +1228,18 @@ static int map_one_share(const HostShareSpec *s, char *out_letter, size_t out_ch
                       letter, attempt, max_attempts, rc,
                       out_detail ? out_detail : "");
             rc = -6;
+
+            /* A permission problem will not fix itself: stop burning attempts
+               (and drive letters) on it and report it to the host. */
+            if (share_error_is_permanent(out_detail)) {
+                agent_log("Shares: %s is not accessible to %s; not retrying.",
+                          s->unc, s->user[0] ? s->user : "the signed-in user");
+                /* Keep the mapping (read access may still be useful) but do not
+                   spend more attempts on it. */
+                if (out_chars) { out_letter[0] = letter; out_letter[1] = '\0'; }
+                remember_mapping(letter, s->unc);
+                return rc;
+            }
         }
 
         if (attempt < max_attempts) {

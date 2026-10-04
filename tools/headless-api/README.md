@@ -375,9 +375,17 @@ Requirements and behavior:
 - `status()` reports what happened per share in `sharedFolders[]`: `letter` is
   the drive letter the guest actually mapped, `status` is `pending`, `ok` or
   `failed`, and `detail` carries the guest's own reason (for example
-  `error:2:System error 86 ... The specified network password is not correct.`).
-  A share the guest could not map is re-sent up to 12 times, 20 s apart, so
-  fixing the account and waiting is usually enough to bring the drive up.
+  `error:2:System error 86 ... The specified network password is not correct.`,
+  or `error:-7:the VM's user session is not ready yet` while the guest is still
+  logging in).
+- A share that is already mapped is only re-verified, and a drive letter that
+  already points at the share is reused, so a folder can never end up on a
+  second drive - even when the host re-sends the list because another share is
+  failing.
+- A share the guest cannot access at all (`Access is denied`) is reported as
+  failed and is **not** retried; other failures are re-sent up to 12 times,
+  20 seconds apart, so fixing the account or the password is usually enough to
+  bring the drive up.
 - Removing an entry (or passing `sharedFolders: []`) deletes the share and, in
   the guest, the drive mapping on the next boot.
 
