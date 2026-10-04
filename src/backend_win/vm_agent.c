@@ -41,6 +41,8 @@ void vm_agent_set_hwnd(HWND hwnd)
 
 /* ---- Per-VM connection state ---- */
 
+static void vm_agent_send_shares(SOCKET s, VmInstance *vm);
+
 typedef struct AgentConn {
     /* Stable VM identifier; survives g_vms[] compaction. The actual
        VmInstance* is resolved via asb_find_vm_by_id() at each use. */
@@ -270,9 +272,12 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
     } else if (strncmp(buf, "log:", 4) == 0) {
         ui_log(L"[%s] %S", vm->name, buf + 4);
+    } else if (strncmp(buf, "share_status:", 13) == 0) {
+        ui_log(L"[%s] Shared folder: %S", vm->name, buf + 13);
+    } else if (strncmp(buf, "share_map_done:", 15) == 0) {
+        ui_log(L"Shared folders mapped in \"%s\" (%S)", vm->name, buf + 15);
     } else if (strcmp(buf, "gpu_query") == 0) {
-        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
-            char header[64];
+        if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {            char header[64];
             int gi;
             sprintf_s(header, sizeof(header), "gpu_query_response:%d",
                       vm->gpu_shares.count);
@@ -293,6 +298,9 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         } else {
             send_line(s, "gpu_none");
         }
+
+        vm_agent_send_shares(s, vm);
+
     } else if (strcmp(buf, "ssh_ready") == 0) {
         vm->ssh_state = 2;
         vm_ssh_proxy_start(vm);
@@ -316,6 +324,44 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         notify_agent_status(vm);
     }
     return 0;
+}
+
+/* Send the VM's shared host folders to the guest agent. The guest maps each
+   line in the interactive user session (cmdkey + net use) and reports back with
+   share_status: lines. A count of 0 tells the guest to drop every mapping it
+   made previously, so removing a share also removes the drive letter. */
+static void vm_agent_send_shares(SOCKET s, VmInstance *vm)
+{
+    char header[64];
+    wchar_t line[4096];
+    char line_a[8192];
+    int i;
+
+    if (_wcsicmp(vm->os_type, L"Windows") != 0) return;   /* Windows guests only */
+
+    /* Refresh the share before the guest maps it. Publishing is idempotent and
+       also runs at VM start, but a guest reboot brings the agent back without
+       going through hcs_start_vm, so this keeps the share present either way. */
+    if (vm->host_shares.count > 0)
+        asb_shares_publish(vm->name, &vm->host_shares);
+
+    sprintf_s(header, sizeof(header), "share_map_response:%d", vm->host_shares.count);
+    send_line(s, header);
+    if (vm->host_shares.count == 0) return;
+
+    for (i = 0; i < vm->host_shares.count; i++) {
+        if (!asb_share_guest_line(&vm->host_shares.items[i], line, ARRAYSIZE(line))) {
+            ui_log(L"Cannot build the guest mapping for share \"%s\".",
+                   vm->host_shares.items[i].share_name);
+            continue;
+        }
+        if (WideCharToMultiByte(CP_UTF8, 0, line, -1, line_a, sizeof(line_a),
+                                NULL, NULL) == 0)
+            continue;
+        send_line(s, line_a);
+    }
+    ui_log(L"Sent %d shared folder(s) to agent for \"%s\".",
+           vm->host_shares.count, vm->name);
 }
 
 /* Send a tagged command and wait for the tagged response.
@@ -439,6 +485,9 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         } else {
             send_line(s, "gpu_none");
         }
+
+        /* Shared host folders: map the drive letters now the guest is up. */
+        vm_agent_send_shares(s, vm);
 
         /* Request SSH install/enable if configured */
         if (vm->ssh_enabled) {

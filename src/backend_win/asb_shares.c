@@ -1,0 +1,414 @@
+/*
+ * asb_shares.c -- host folders shared into a Windows guest as SMB drive letters.
+ *
+ * Publishing a share does three things on the host:
+ *   1. create/refresh an SMB share for the folder (net share)
+ *   2. open inbound TCP 445 for the VM's NAT subnet only (netsh advfirewall)
+ *   3. keep the password for the share account DPAPI-protected in the config
+ *
+ * The guest agent does the mapping (cmdkey + net use) in the interactive user
+ * session; asb_share_guest_line() builds the line it receives over the agent
+ * control channel.
+ */
+
+#include <windows.h>
+#include <wincrypt.h>
+#include <stdio.h>
+#include <wchar.h>
+#include <ctype.h>
+
+#include "asb_shares.h"
+#include "hcn_network.h"
+#include "ui.h"
+
+#pragma comment(lib, "crypt32.lib")
+
+/* ---- Small helpers ---- */
+
+/* Run a command line hidden and wait for it. Returns the exit code, or -1 if
+   the process could not be started. */
+static int run_hidden(const wchar_t *cmdline)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t *mut;
+    DWORD code = 0;
+    size_t len = wcslen(cmdline) + 1;
+
+    mut = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, len * sizeof(wchar_t));
+    if (!mut) return -1;
+    wcscpy_s(mut, len, cmdline);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessW(NULL, mut, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        HeapFree(GetProcessHeap(), 0, mut);
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, 30000);
+    if (!GetExitCodeProcess(pi.hProcess, &code)) code = (DWORD)-1;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    HeapFree(GetProcessHeap(), 0, mut);
+    return (int)code;
+}
+
+static BOOL dir_exists(const wchar_t *path)
+{
+    DWORD attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* TRUE when path is inside root (case-insensitive, path-boundary aware). */
+static BOOL path_under(const wchar_t *path, const wchar_t *root)
+{
+    size_t n;
+    if (!root || !root[0]) return FALSE;
+    n = wcslen(root);
+    if (_wcsnicmp(path, root, n) != 0) return FALSE;
+    return path[n] == L'\0' || path[n] == L'\\';
+}
+
+static void env_dir(const wchar_t *name, wchar_t *out, size_t out_chars)
+{
+    out[0] = L'\0';
+    GetEnvironmentVariableW(name, out, (DWORD)out_chars);
+}
+
+/* A folder may not be a drive root, one of the system directories, or the app's
+   own data directory. */
+static BOOL path_is_allowed(const wchar_t *path)
+{
+    static const wchar_t *const env_blocks[] = {
+        L"SystemRoot", L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramData"
+    };
+    wchar_t blocked[MAX_PATH];
+    int i;
+
+    if (wcslen(path) <= 3) return FALSE;              /* "C:\" or shorter */
+    if (path[1] != L':' || path[2] != L'\\') return FALSE;
+
+    /* SystemRoot, Program Files and ProgramData cover the Windows directory and
+       the VM disk tree (which lives under ProgramData). */
+    for (i = 0; i < (int)(sizeof(env_blocks) / sizeof(env_blocks[0])); i++) {
+        env_dir(env_blocks[i], blocked, ARRAYSIZE(blocked));
+        if (blocked[0] && path_under(path, blocked)) return FALSE;
+    }
+
+    return TRUE;
+}
+
+/* ---- Password protection (DPAPI, hex-encoded for the config file) ---- */
+
+static void bytes_to_hex(const BYTE *in, DWORD n, wchar_t *out, size_t out_chars)
+{
+    static const wchar_t hex[] = L"0123456789abcdef";
+    DWORD i;
+
+    if (out_chars < (size_t)n * 2 + 1) {
+        if (out_chars) out[0] = L'\0';
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        out[i * 2]     = hex[(in[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[in[i] & 0xF];
+    }
+    out[n * 2] = L'\0';
+}
+
+static BOOL hex_to_bytes(const wchar_t *in, BYTE *out, DWORD out_cap, DWORD *out_len)
+{
+    DWORD n, i;
+
+    n = (DWORD)wcslen(in);
+    if (n == 0 || (n % 2) != 0 || n / 2 > out_cap) return FALSE;
+    for (i = 0; i < n; i++) {
+        wchar_t c = in[i];
+        int v;
+        if (c >= L'0' && c <= L'9') v = c - L'0';
+        else if (c >= L'a' && c <= L'f') v = c - L'a' + 10;
+        else if (c >= L'A' && c <= L'F') v = c - L'A' + 10;
+        else return FALSE;
+        if ((i & 1) == 0) out[i / 2] = (BYTE)(v << 4);
+        else out[i / 2] |= (BYTE)v;
+    }
+    *out_len = n / 2;
+    return TRUE;
+}
+
+BOOL asb_share_protect_password(const wchar_t *plain, wchar_t *out, size_t out_chars)
+{
+    DATA_BLOB in, encrypted;
+    char utf8[1024];
+    int n;
+
+    if (out_chars == 0) return FALSE;
+    out[0] = L'\0';
+    if (!plain || !plain[0]) return TRUE;   /* no password to protect */
+
+    n = WideCharToMultiByte(CP_UTF8, 0, plain, -1, utf8, sizeof(utf8), NULL, NULL);
+    if (n <= 0) return FALSE;
+
+    in.pbData = (BYTE *)utf8;
+    in.cbData = (DWORD)n - 1;               /* exclude the NUL */
+    encrypted.pbData = NULL;
+    encrypted.cbData = 0;
+
+    if (!CryptProtectData(&in, L"AppSandbox shared folder", NULL, NULL, NULL,
+                          CRYPTPROTECT_UI_FORBIDDEN, &encrypted))
+        return FALSE;
+
+    bytes_to_hex(encrypted.pbData, encrypted.cbData, out, out_chars);
+    LocalFree(encrypted.pbData);
+    SecureZeroMemory(utf8, sizeof(utf8));
+    return out[0] != L'\0';
+}
+
+BOOL asb_share_unprotect_password(const wchar_t *enc, wchar_t *out, size_t out_chars)
+{
+    DATA_BLOB in, plain;
+    BYTE blob[1024];
+    DWORD blob_len = 0;
+
+    if (out_chars == 0) return FALSE;
+    out[0] = L'\0';
+    if (!enc || !enc[0]) return TRUE;
+
+    if (!hex_to_bytes(enc, blob, sizeof(blob), &blob_len)) return FALSE;
+    in.pbData = blob;
+    in.cbData = blob_len;
+    plain.pbData = NULL;
+    plain.cbData = 0;
+
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL,
+                            CRYPTPROTECT_UI_FORBIDDEN, &plain))
+        return FALSE;
+
+    MultiByteToWideChar(CP_UTF8, 0, (const char *)plain.pbData, (int)plain.cbData,
+                        out, (int)out_chars);
+    out[out_chars - 1] = L'\0';
+    LocalFree(plain.pbData);
+    SecureZeroMemory(blob, sizeof(blob));
+    return TRUE;
+}
+
+/* ---- Naming ---- */
+
+void asb_shares_name_for_vm(AsbHostShareList *list, const wchar_t *vm_name)
+{
+    wchar_t safe[48];
+    int i, n = 0;
+
+    if (!list) return;
+
+    for (i = 0; vm_name && vm_name[i] && n < (int)ARRAYSIZE(safe) - 1; i++) {
+        wchar_t c = vm_name[i];
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+            (c >= L'0' && c <= L'9') || c == L'-' || c == L'_')
+            safe[n++] = c;
+    }
+    safe[n] = L'\0';
+    if (n == 0) wcscpy_s(safe, ARRAYSIZE(safe), L"VM");
+
+    for (i = 0; i < list->count; i++) {
+        if (list->items[i].share_name[0]) continue;
+        swprintf_s(list->items[i].share_name, ASB_SHARE_NAME_MAX,
+                   L"AppSandbox.%s.%d", safe, i);
+    }
+}
+
+/* ---- Validation ---- */
+
+const wchar_t *asb_shares_validate(const AsbHostShareList *list, int network_mode)
+{
+    int i, j;
+
+    if (!list || list->count == 0) return NULL;
+    if (list->count > ASB_MAX_HOST_SHARES)
+        return L"Too many shared folders (maximum 8).";
+
+    if (network_mode != 1 /* NET_NAT */)
+        return L"Shared folders need NAT networking: the guest reaches the host at the NAT gateway.";
+
+    for (i = 0; i < list->count; i++) {
+        const AsbHostShare *s = &list->items[i];
+
+        if (!s->host_path[0]) return L"Every shared folder needs a host path.";
+        if (!dir_exists(s->host_path))
+            return L"A shared folder does not exist on the host (or is not a folder).";
+        if (!path_is_allowed(s->host_path))
+            return L"Cannot share a drive root or a Windows system folder.";
+        if (!s->share_name[0])
+            return L"Shared folder has no share name.";
+        if (!s->user[0])
+            return L"Shared folders need a host user name: the guest signs in to the share as that account.";
+        if (!s->pass_enc[0])
+            return L"Shared folders need the host account's password.";
+
+        if (s->drive_letter) {
+            wchar_t c = (wchar_t)towupper(s->drive_letter);
+            if (c < L'D' || c > L'Z')
+                return L"Drive letter must be an unused letter from D: to Z:.";
+        }
+
+        for (j = 0; j < i; j++) {
+            const AsbHostShare *p = &list->items[j];
+            if (_wcsicmp(p->host_path, s->host_path) == 0)
+                return L"The same host folder is shared twice.";
+            if (_wcsicmp(p->share_name, s->share_name) == 0)
+                return L"Two shared folders have the same share name.";
+            if (p->drive_letter && s->drive_letter &&
+                towupper(p->drive_letter) == towupper(s->drive_letter))
+                return L"Two shared folders claim the same drive letter.";
+        }
+    }
+    return NULL;
+}
+
+/* ---- Publish / withdraw ---- */
+
+/* Firewall rule name derives from the share name alone, so withdrawing a share
+   never needs the VM name again. */
+static void rule_name_for(const wchar_t *share_name, wchar_t *out, size_t out_chars)
+{
+    swprintf_s(out, out_chars, L"AppSandbox share %s", share_name);
+}
+
+static void firewall_delete(const wchar_t *share_name)
+{
+    wchar_t rule[256], cmd[600];
+    rule_name_for(share_name, rule, ARRAYSIZE(rule));
+    swprintf_s(cmd, ARRAYSIZE(cmd),
+        L"netsh.exe advfirewall firewall delete rule name=\"%s\"", rule);
+    (void)run_hidden(cmd);
+}
+
+static BOOL firewall_allow_share(const wchar_t *share_name)
+{
+    wchar_t rule[256], cmd[800];
+    const char *base = hcn_nat_subnet_base();
+
+    rule_name_for(share_name, rule, ARRAYSIZE(rule));
+    firewall_delete(share_name);   /* idempotent: replace the old rule */
+
+    swprintf_s(cmd, ARRAYSIZE(cmd),
+        L"netsh.exe advfirewall firewall add rule name=\"%s\" dir=in action=allow "
+        L"protocol=TCP localport=445 remoteip=%S.0/24 profile=any",
+        rule, base);
+    return run_hidden(cmd) == 0;
+}
+
+HRESULT asb_shares_publish(const wchar_t *vm_name, const AsbHostShareList *list)
+{
+    int i, published = 0, failed = 0;
+    wchar_t cmd[1600];
+
+    (void)vm_name;
+    if (!list || list->count == 0) return S_OK;
+
+    for (i = 0; i < list->count; i++) {
+        const AsbHostShare *s = &list->items[i];
+
+        if (!dir_exists(s->host_path)) {
+            ui_log(L"Shared folder missing on the host: %s (share %s skipped)",
+                   s->host_path, s->share_name);
+            failed++;
+            continue;
+        }
+
+        /* Share names are namespaced ("AppSandbox.<vm>.<n>"), so replacing an
+           entry of ours is safe; delete first so a stale grant cannot linger. */
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe share \"%s\" /delete /y", s->share_name);
+        (void)run_hidden(cmd);
+
+        if (swprintf_s(cmd, ARRAYSIZE(cmd),
+                L"net.exe share \"%s\"=\"%s\" /grant:\"%s\",FULL /cache:none "
+                L"/remark:\"AppSandbox shared folder\"",
+                s->share_name, s->host_path, s->user) < 0 ||
+            run_hidden(cmd) != 0) {
+            ui_log(L"Failed to publish share %s for %s (run as administrator?)",
+                   s->share_name, s->host_path);
+            failed++;
+            continue;
+        }
+
+        if (!firewall_allow_share(s->share_name)) {
+            ui_log(L"Failed to open inbound SMB for share %s (firewall)", s->share_name);
+            failed++;
+            continue;
+        }
+
+        ui_log(L"Shared folder published: %s -> \\\\%S.1\\%s",
+               s->host_path, hcn_nat_subnet_base(), s->share_name);
+        published++;
+    }
+
+    if (failed) return E_FAIL;
+    return published ? S_OK : S_FALSE;
+}
+
+void asb_shares_withdraw(const AsbHostShareList *list)
+{
+    int i;
+    wchar_t cmd[600];
+
+    if (!list) return;
+
+    for (i = 0; i < list->count; i++) {
+        const AsbHostShare *s = &list->items[i];
+        if (!s->share_name[0]) continue;
+
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"net.exe share \"%s\" /delete /y", s->share_name);
+        (void)run_hidden(cmd);
+        firewall_delete(s->share_name);
+        ui_log(L"Shared folder withdrawn: %s", s->share_name);
+    }
+}
+
+/* ---- Guest-side mapping line ---- */
+
+BOOL asb_share_guest_line(const AsbHostShare *share, wchar_t *out, size_t out_chars)
+{
+    wchar_t pass[256];
+    wchar_t letter[8];
+    wchar_t qualified[192];
+    const wchar_t *user;
+
+    if (!share || !out || out_chars == 0) return FALSE;
+    out[0] = L'\0';
+
+    if (!asb_share_unprotect_password(share->pass_enc, pass, ARRAYSIZE(pass)))
+        return FALSE;
+
+    /* A bare account name would be offered to the server with the guest's own
+       domain. Local accounts on this host need the machine name. */
+    user = share->user;
+    if (share->user[0] && wcschr(share->user, L'\\') == NULL) {
+        wchar_t computer[80];
+        DWORD computer_len = ARRAYSIZE(computer);
+        qualified[0] = L'\0';
+        if (GetComputerNameW(computer, &computer_len))
+            swprintf_s(qualified, ARRAYSIZE(qualified), L"%s\\%s", computer, share->user);
+        if (qualified[0]) user = qualified;
+    }
+
+    if (share->drive_letter)
+        swprintf_s(letter, ARRAYSIZE(letter), L"%c", towupper(share->drive_letter));
+    else
+        wcscpy_s(letter, ARRAYSIZE(letter), L"auto");
+
+    if (swprintf_s(out, out_chars, L"%s|\\\\%S.1\\%s|%s|%s",
+                   letter, hcn_nat_subnet_base(), share->share_name,
+                   user, pass) < 0) {
+        SecureZeroMemory(pass, sizeof(pass));
+        return FALSE;
+    }
+
+    SecureZeroMemory(pass, sizeof(pass));
+    return TRUE;
+}

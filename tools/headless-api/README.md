@@ -318,9 +318,54 @@ rather than forwarding bad input to the core.
 | `sshEnabled` | provision SSH + forward a loopback port |
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
+| `sharedFolders` | Windows guests only: host folders to share as drive letters (see below) |
 
-`edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode` with the same
-range rules, and **only while the VM is stopped**. `name` cannot be changed.
+`edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode`, `sharedFolders`
+with the same rules, and **only while the VM is stopped**. `name` cannot be
+changed.
+
+### Shared host folders (Windows guests, NAT only)
+
+`sharedFolders` is a list of objects; each one publishes a host folder as an SMB
+share and maps it to a drive letter inside the guest:
+
+```python
+c.create(name="dev", osType="Windows", imagePath=r"C:\ISO\win11.iso",
+         ramMb=8192, cpuCores=4, networkMode=1,
+         adminUser="user", adminPass="test123",
+         sharedFolders=[
+             {"path": r"C:\work\shared", "driveLetter": "Z",
+              "user": "HOSTPC\\andrew", "password": "secret"},
+             {"path": r"D:\assets"},          # guest picks a free letter
+         ])
+```
+
+- `path` (required): an existing host folder. Drive roots and Windows system
+  folders (`%SystemRoot%`, `%ProgramFiles%`, `%ProgramData%`) are rejected, as
+  are duplicates.
+- `driveLetter` (optional): `D`–`Z`; omit it and the guest picks a free letter.
+- `user` / `password` (required): the **host** account the guest signs in as.
+  A bare name is qualified with the host's computer name for the guest. The
+  password is stored DPAPI-protected and never leaves the host except over the
+  local Hyper-V socket, where the guest agent turns it into a persistent
+  mapping (`net use`). A password containing a double quote is rejected.
+  On edit, an entry sent **without** `password` keeps the password already
+  stored for that folder path, so a client can update the rest of a share
+  without holding the secret.
+- `readOnly` (optional, default `false`): accepted for forward compatibility;
+  shares are currently read-write.
+
+Requirements and behavior:
+
+- The VM must use **NAT networking** (`networkMode: 1`): the guest reaches the
+  host at its NAT gateway. Creating or editing with `sharedFolders` and any
+  other mode is rejected with `400`.
+- The host share and its firewall rule (inbound TCP 445 from the VM subnet
+  only) exist **while the VM runs** and are removed when it stops.
+- The account you name must be able to read and write the folder (its NTFS
+  permissions apply), and the daemon must run elevated to publish the share.
+- Removing an entry (or passing `sharedFolders: []`) deletes the share and, in
+  the guest, the drive mapping on the next boot.
 
 ### SSH key deploy (password-less login)
 

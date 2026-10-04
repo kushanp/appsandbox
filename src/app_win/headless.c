@@ -25,6 +25,7 @@
 #pragma warning(pop)
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <stdarg.h>
 
 #include "headless.h"
@@ -243,6 +244,7 @@ static const char *derive_state(VmInstance *v)
 static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 {
     wchar_t disk_directory[MAX_PATH];
+    int i;
     pos += sprintf_s(out + pos, cap - pos, "{\"name\":");
     pos  = append_wstr(out, cap, pos, v->name);
     pos += sprintf_s(out + pos, cap - pos, ",\"osType\":");
@@ -267,7 +269,22 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
-    pos += sprintf_s(out + pos, cap - pos, "}");
+    pos += sprintf_s(out + pos, cap - pos, ",\"sharedFolders\":[");
+    for (i = 0; i < v->host_shares.count; i++) {
+        const AsbHostShare *s = &v->host_shares.items[i];
+        pos += sprintf_s(out + pos, cap - pos, "%s{\"path\":", i ? "," : "");
+        pos = append_wstr(out, cap, pos, s->host_path);
+        if (s->drive_letter)
+            pos += sprintf_s(out + pos, cap - pos, ",\"driveLetter\":\"%c\"",
+                             s->drive_letter);
+        else
+            pos += sprintf_s(out + pos, cap - pos, ",\"driveLetter\":\"\"");
+        pos += sprintf_s(out + pos, cap - pos, ",\"user\":");
+        pos = append_wstr(out, cap, pos, s->user);
+        pos += sprintf_s(out + pos, cap - pos, ",\"readOnly\":%s}",
+                         s->read_only ? "true" : "false");
+    }
+    pos += sprintf_s(out + pos, cap - pos, "]}");
     return pos;
 }
 
@@ -566,7 +583,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"sharedFolders\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -642,6 +659,8 @@ static int handle_request(PHTTP_REQUEST req)
             wchar_t disk_directory[MAX_PATH + 1]={0};
             wchar_t gpu_id[512]={0};
             char nu[256]={0};
+            AsbHostShareList shares;
+            ZeroMemory(&shares, sizeof(shares));
             if (!body_to_wide(req, body, 8192)) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "Request body must contain valid UTF-8 JSON without NUL bytes.");
@@ -712,6 +731,19 @@ static int handle_request(PHTTP_REQUEST req)
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
                 return 0;
+            }
+            /* Shared host folders: Windows guests map them as drive letters. */
+            if (json_has_key(body, L"sharedFolders")) {
+                const wchar_t *serr = json_read_shared_folders(body, &shares,
+                                                          name, cfg.network_mode);
+                if (serr) {
+                    char message[512] = {0};
+                    WideCharToMultiByte(CP_UTF8, 0, serr, -1, message, sizeof(message), NULL, NULL);
+                    SecureZeroMemory(pass, sizeof(pass));
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                    return 0;
+                }
+                if (shares.count) cfg.host_shares = &shares;
             }
             {
                 const wchar_t *password_os = os;
@@ -853,6 +885,19 @@ static int handle_request(PHTTP_REQUEST req)
                 if (json_get_int(body, L"networkMode", &iv)) {
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
+                }
+                if (json_has_key(body, L"sharedFolders")) {
+                    AsbHostShareList shares;
+                    const wchar_t *serr = json_parse_shared_folders(body, &shares);
+                    if (!serr) serr = asb_vm_validate_shares(vm, &shares);
+                    if (serr) {
+                        char message[512] = {0};
+                        WideCharToMultiByte(CP_UTF8, 0, serr, -1, message, sizeof(message), NULL, NULL);
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                        return 0;
+                    }
+                    hr = asb_vm_set_shares(vm, &shares);
+                    if (FAILED(hr)) { send_hr(req->RequestId, "editVm", nu, hr); return 0; }
                 }
                 asb_save();
                 if (SUCCEEDED(hr)) {
